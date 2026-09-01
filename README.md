@@ -63,18 +63,18 @@ A wave is one CSV. It carries its own state, so the folder it sits in tells you 
 that wave has got.
 
 ```mermaid
-flowchart TD
-    A["Engineer authors the wave CSV"] --> IN["IN/<br>waiting for its next phase"]
-    IN -->|"-ValidateOnly"| DRY["Dry run: resolves everything,<br>writes PhaseNPortGroups only"]
+graph TD
+    A[Engineer authors the wave CSV] --> IN[IN folder: waiting for its next phase]
+    IN -->|ValidateOnly| DRY[Dry run: writes PhaseNPortGroups only]
     DRY --> IN
-    IN -->|"engineer picks it<br>run marker written"| RUN["Running/<br>claimed by one engineer"]
-    RUN -->|"a VM failed, or the run died"| IN
-    RUN -->|"every row reached the phase"| WHICH{"which phase<br>just finished"}
-    WHICH -->|"phase 1"| P1["Phase1/"]
-    WHICH -->|"phase 2"| P2["Phase2/"]
-    WHICH -->|"phase 3"| P3["Phase3/<br>fully migrated"]
-    P1 -->|"you move it back<br>when the storage wave is due"| IN
-    P2 -->|"you move it back<br>when the cross vCenter wave is due"| IN
+    IN -->|engineer picks it, run marker written| RUN[Running folder: claimed by one engineer]
+    RUN -->|a VM failed, or the run died| IN
+    RUN -->|every row reached the phase| WHICH{which phase just finished}
+    WHICH -->|phase 1| P1[Phase1 folder]
+    WHICH -->|phase 2| P2[Phase2 folder]
+    WHICH -->|phase 3| P3[Phase3 folder: fully migrated]
+    P1 -->|you move it back for the storage wave| IN
+    P2 -->|you move it back for the cross vCenter wave| IN
 ```
 
 The two arrows out of `Phase1/` and `Phase2/` are the only manual steps: nothing moves a
