@@ -1,6 +1,8 @@
-# Working folders are tracked, the data that flows through them is not.
+# Working folders are tracked, the waves that flow through them are not.
 IN/*
 !IN/.gitkeep
+Running/*
+!Running/.gitkeep
 Phase1/*
 !Phase1/.gitkeep
 Phase2/*

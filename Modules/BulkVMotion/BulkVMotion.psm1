@@ -127,28 +127,92 @@ function Stop-BulkVMotionLog {
 
 #region CSV handling ------------------------------------------------------------
 
-# Only VMName is mandatory - everything else can come from the run defaults.
+# Only VMName is mandatory - everything else has a run level fallback.
 $script:RequiredCsvColumns = @('VMName')
 
-# Columns the operator authors. Each phase has its own target columns so one file can
-# carry the whole journey; the generic Target* columns are the fallback for a simple
-# single phase file.
+# What the engineer authors. One row describes the whole journey: where the VM goes in
+# each phase and which distributed switch it lands on.
 $script:PlanCsvColumns = @(
     'VMName', 'SourceCluster', 'Notes'
-    'Phase1Cluster', 'Phase1Host', 'Phase1PortGroup'
+    'Phase1Cluster', 'Phase1VDS', 'Phase1Host'
     'Phase2Datastore'
-    'Phase3Cluster', 'Phase3Host', 'Phase3PortGroup'
-    'TargetCluster', 'TargetHost', 'TargetDatastore', 'TargetFolder', 'TargetPortGroup'
+    'Phase3Cluster', 'Phase3VDS', 'Phase3Host'
 )
 
-# Columns the script writes back before archiving the file, so the CSV becomes the
-# record of where each VM actually landed.
+# Filled in by the script, but an engineer may edit them to pin a port group the VLAN
+# lookup could not settle on its own. One cell per phase holds every adapter:
+#   Network adapter 1=PG-Prod-100; Network adapter 2=PG-Bkp-300
+$script:PortGroupCsvColumns = @('Phase1PortGroups', 'Phase3PortGroups')
+
+# Written back as each phase completes, so the file becomes the record of the wave.
 $script:ResultCsvColumns = @(
-    'PhaseCompleted', 'CompletedAt', 'ResultVIServer', 'ResultCluster',
-    'ResultHost', 'ResultDatastore', 'ResultPortGroup'
+    'PhaseCompleted', 'CompletedAt', 'CompletedBy', 'ResultVIServer',
+    'ResultCluster', 'ResultHost', 'ResultDatastore'
 )
 
-$script:KnownCsvColumns = $script:PlanCsvColumns + $script:ResultCsvColumns
+$script:KnownCsvColumns = $script:PlanCsvColumns + $script:PortGroupCsvColumns + $script:ResultCsvColumns
+
+function Get-PhasePortGroupColumn {
+    <#
+    .SYNOPSIS
+        The name of the port group column for a phase, or $null for phase 2.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateRange(1, 3)][int]$Phase)
+
+    switch ($Phase) {
+        1 { 'Phase1PortGroups' }
+        2 { $null }
+        3 { 'Phase3PortGroups' }
+    }
+}
+
+function ConvertFrom-PortGroupList {
+    <#
+    .SYNOPSIS
+        Parses the 'adapter=portgroup; adapter=portgroup' cell into a lookup.
+    .DESCRIPTION
+        A bare value with no adapter name applies to every adapter, which keeps the
+        simple single NIC case readable. Spacing around the separators does not matter.
+    .OUTPUTS
+        Hashtable of adapter name -> port group name. The key '*' means all adapters.
+    #>
+    [CmdletBinding()]
+    param([string]$Value)
+
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $map }
+
+    foreach ($part in ($Value -split ';')) {
+        $entry = $part.Trim()
+        if (-not $entry) { continue }
+
+        $split = $entry.IndexOf('=')
+        if ($split -lt 0) {
+            $map['*'] = $entry
+            continue
+        }
+
+        $adapter = $entry.Substring(0, $split).Trim()
+        $target  = $entry.Substring($split + 1).Trim()
+        if ($adapter -and $target) { $map[$adapter] = $target }
+    }
+
+    return $map
+}
+
+function ConvertTo-PortGroupList {
+    <#
+    .SYNOPSIS
+        Renders the resolved per adapter port groups back into one cell.
+    .PARAMETER Mapping
+        The Mappings collection from Get-VMNetworkMigrationPlan.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Mapping)
+
+    return (@($Mapping | ForEach-Object { '{0}={1}' -f $_.AdapterName, $_.TargetName }) -join '; ')
+}
 
 function Import-MigrationCsv {
     <#
@@ -269,25 +333,19 @@ function Get-PhaseRowValue {
     .SYNOPSIS
         Reads a target value for the phase being run.
     .DESCRIPTION
-        Precedence is: the phase specific column (Phase1Cluster), then the generic
-        column (TargetCluster), then the run level default. That lets one file describe
-        all three phases while a simple single phase file keeps working unchanged.
+        The phase column wins; otherwise the run level default applies. There is
+        deliberately no second column to fall back on, so a value in the file always
+        comes from the one cell named after its phase.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Row,
         [Parameter(Mandatory)][string]$PhaseColumn,
-        [string]$GenericColumn,
         [string]$Default
     )
 
     $property = $Row.PSObject.Properties[$PhaseColumn]
     if ($property -and -not [string]::IsNullOrWhiteSpace($property.Value)) { return [string]$property.Value }
-
-    if ($GenericColumn) {
-        $property = $Row.PSObject.Properties[$GenericColumn]
-        if ($property -and -not [string]::IsNullOrWhiteSpace($property.Value)) { return [string]$property.Value }
-    }
 
     return $Default
 }
@@ -297,12 +355,16 @@ function Update-MigrationCsv {
     .SYNOPSIS
         Writes the outcome of a phase back into the CSV file.
     .DESCRIPTION
-        Rows that completed the phase get PhaseCompleted, CompletedAt and where the VM
-        landed; rows that failed keep the phase they were already at, so a re-run knows
-        what is still outstanding. Author columns and row order are preserved, and every
-        row is given the same set of columns so Export-Csv cannot drop one.
+        Whatever columns an update object carries are written to the row on that CSV
+        line; everything else on the row is left exactly as the engineer wrote it. A
+        real run records the phase and where the VM landed, while a dry run writes only
+        the resolved port groups so they can be reviewed before anything is migrated.
+
+        Rows with no update keep the phase they were already at, so a re-run knows what
+        is still outstanding. Row order is preserved and every row is given the same set
+        of columns, so Export-Csv cannot drop one.
     .PARAMETER Update
-        One object per completed row: CsvLine plus the values to record.
+        One object per row to touch: CsvLine plus any of the known columns to record.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -318,10 +380,15 @@ function Update-MigrationCsv {
     $byLine = @{}
     foreach ($item in $Update) { $byLine[[int]$item.CsvLine] = $item }
 
-    # Union of what the file already has and what this run adds.
+    # Union of what the file already has and what this run wants to write.
     $columns = [System.Collections.Generic.List[string]]::new()
     foreach ($name in $rows[0].PSObject.Properties.Name) { if (-not $columns.Contains($name)) { $columns.Add($name) } }
-    foreach ($name in $script:ResultCsvColumns) { if (-not $columns.Contains($name)) { $columns.Add($name) } }
+    foreach ($item in $Update) {
+        foreach ($name in $item.PSObject.Properties.Name) {
+            if ($name -eq 'CsvLine') { continue }
+            if (-not $columns.Contains($name)) { $columns.Add($name) }
+        }
+    }
 
     $updated = @()
     $lineNumber = 1
@@ -335,9 +402,9 @@ function Update-MigrationCsv {
 
         if ($byLine.ContainsKey($lineNumber)) {
             $outcome = $byLine[$lineNumber]
-            foreach ($name in $script:ResultCsvColumns) {
-                $property = $outcome.PSObject.Properties[$name]
-                if ($property) { $record[$name] = $property.Value }
+            foreach ($property in $outcome.PSObject.Properties) {
+                if ($property.Name -eq 'CsvLine') { continue }
+                $record[$property.Name] = $property.Value
             }
         }
 
@@ -348,7 +415,7 @@ function Update-MigrationCsv {
         $updated += [pscustomobject]$record
     }
 
-    if ($PSCmdlet.ShouldProcess($Path, "Record the phase result for $($Update.Count) VM(s)")) {
+    if ($PSCmdlet.ShouldProcess($Path, "Record the outcome for $($Update.Count) VM(s)")) {
         $updated | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
     }
 }
@@ -393,6 +460,433 @@ function Move-ProcessedCsv {
 }
 
 #endregion CSV handling
+
+#region Credentials -------------------------------------------------------------
+
+function Test-IsWindowsPlatform {
+    <#
+    .SYNOPSIS
+        True on Windows. Windows PowerShell 5.1 only ever runs there.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $variable = Get-Variable -Name 'IsWindows' -ErrorAction SilentlyContinue
+    if ($variable) { return [bool]$variable.Value }
+    return $true
+}
+
+function Get-MigrationCredentialPath {
+    <#
+    .SYNOPSIS
+        Where this engineer's credential for one vCenter is kept.
+    .DESCRIPTION
+        Under the engineer's own profile, so on a shared mgmt server each engineer has
+        their own and cannot read anyone else's.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$VIServer)
+
+    # $HOME is read only, so the profile root gets its own variable.
+    $profileRoot = if ($env:BVM_CREDENTIAL_HOME) { $env:BVM_CREDENTIAL_HOME }
+    elseif ($env:USERPROFILE) { $env:USERPROFILE }
+    else { $HOME }
+
+    $folder = Join-Path $profileRoot '.bulkvmotion'
+    $safe   = ($VIServer.ToLowerInvariant() -replace '[^\w\.\-]', '_')
+    return (Join-Path $folder ('{0}.cred.xml' -f $safe))
+}
+
+function Save-MigrationCredential {
+    <#
+    .SYNOPSIS
+        Stores a vCenter credential for the engineer running this, encrypted to them.
+    .DESCRIPTION
+        Export-Clixml protects the password with DPAPI, tied to this Windows account on
+        this machine. Another engineer on the same mgmt server cannot decrypt it and the
+        file is useless if copied elsewhere.
+
+        On Linux and macOS PowerShell does not encrypt a SecureString at all, so saving
+        is refused there rather than writing a password in the clear.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$VIServer,
+        [Parameter(Mandatory)][System.Management.Automation.PSCredential]$Credential
+    )
+
+    if (-not (Test-IsWindowsPlatform)) {
+        throw 'Credentials can only be stored on Windows: on Linux and macOS, Export-Clixml does not encrypt the password. Use -SourceCredential/-TargetCredential, or let the run prompt for it.'
+    }
+
+    $path   = Get-MigrationCredentialPath -VIServer $VIServer
+    $folder = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+
+    if ($PSCmdlet.ShouldProcess($path, "Store the credential for $VIServer")) {
+        $Credential | Export-Clixml -LiteralPath $path
+    }
+
+    return $path
+}
+
+function Get-MigrationCredential {
+    <#
+    .SYNOPSIS
+        Finds the credential to connect to one vCenter with.
+    .DESCRIPTION
+        In order: what the caller passed on the command line, then this engineer's
+        stored credential, then a prompt. Returns $null only when nothing is available
+        and prompting was not allowed, which lets the caller fall back to the logged on
+        Windows account.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$VIServer,
+        [System.Management.Automation.PSCredential]$Credential,
+        [switch]$NoPrompt
+    )
+
+    if ($Credential) {
+        Write-BulkVMotionLog -Level Debug -Message "Using the credential passed on the command line for $VIServer."
+        return $Credential
+    }
+
+    $path = Get-MigrationCredentialPath -VIServer $VIServer
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $stored = Import-Clixml -LiteralPath $path
+            Write-BulkVMotionLog -Message "Using the stored credential for $VIServer ($($stored.UserName))."
+            return $stored
+        }
+        catch {
+            Write-BulkVMotionLog -Level Warning -Message "The stored credential for $VIServer could not be read ($($_.Exception.Message)). Save it again with .\Save-MigrationCredential.ps1 -VIServer $VIServer"
+        }
+    }
+
+    if ($NoPrompt) {
+        Write-BulkVMotionLog -Level Warning -Message "No stored credential for $VIServer - connecting as the logged on Windows account."
+        return $null
+    }
+
+    Write-BulkVMotionLog -Message "No stored credential for $VIServer - prompting. Run .\Save-MigrationCredential.ps1 -VIServer $VIServer to avoid this next time."
+    return (Get-Credential -Message "Credentials for $VIServer")
+}
+
+#endregion Credentials
+
+#region Waves -------------------------------------------------------------------
+
+function Get-WaveRunMarkerPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$CsvPath)
+
+    $folder = Split-Path -Parent $CsvPath
+    return (Join-Path $folder ('{0}.run.json' -f [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)))
+}
+
+function Write-WaveRunMarker {
+    <#
+    .SYNOPSIS
+        Records who is running a wave, so a colleague sees it is taken.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$CsvPath,
+        [Parameter(Mandatory)][int]$Phase
+    )
+
+    $process = Get-Process -Id $PID
+    $marker = [ordered]@{
+        Engineer         = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+        Machine          = $env:COMPUTERNAME
+        ProcessId        = $PID
+        ProcessStartedAt = $process.StartTime.ToString('o')
+        StartedAt        = (Get-Date).ToString('o')
+        Phase            = $Phase
+        Wave             = [System.IO.Path]::GetFileName($CsvPath)
+    }
+
+    $path = Get-WaveRunMarkerPath -CsvPath $CsvPath
+    if ($PSCmdlet.ShouldProcess($path, 'Mark the wave as running')) {
+        $marker | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding UTF8
+    }
+    return $path
+}
+
+function Read-WaveRunMarker {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$CsvPath)
+
+    $path = Get-WaveRunMarkerPath -CsvPath $CsvPath
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) }
+    catch {
+        Write-BulkVMotionLog -Level Warning -Message "The run marker '$path' could not be read: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Test-WaveRunAlive {
+    <#
+    .SYNOPSIS
+        Is the run that claimed this wave still going?
+    .DESCRIPTION
+        Only answerable for a run on this machine: the process id is checked, and its
+        start time too so a recycled id cannot masquerade as the original run. A marker
+        from another machine is assumed alive, because there is no way to tell from here.
+    .OUTPUTS
+        PSCustomObject with Alive and Reason.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Marker)
+
+    if ($Marker.Machine -ne $env:COMPUTERNAME) {
+        return [pscustomobject]@{ Alive = $true; Reason = "running on $($Marker.Machine)" }
+    }
+
+    $process = Get-Process -Id $Marker.ProcessId -ErrorAction SilentlyContinue
+    if (-not $process) {
+        return [pscustomobject]@{ Alive = $false; Reason = 'the process is gone' }
+    }
+
+    if ($Marker.PSObject.Properties['ProcessStartedAt'] -and $Marker.ProcessStartedAt) {
+        try {
+            $recorded = [datetime]::Parse($Marker.ProcessStartedAt)
+            if ([math]::Abs(($process.StartTime - $recorded).TotalSeconds) -gt 5) {
+                return [pscustomobject]@{ Alive = $false; Reason = 'the process id belongs to something else now' }
+            }
+        }
+        catch {
+            Write-BulkVMotionLog -Level Debug -Message "Could not compare the process start time in the run marker: $($_.Exception.Message)"
+        }
+    }
+
+    return [pscustomobject]@{ Alive = $true; Reason = 'still running' }
+}
+
+function Get-AvailableWave {
+    <#
+    .SYNOPSIS
+        Lists the waves an engineer could run, with the state of each.
+    .DESCRIPTION
+        Waves waiting in IN and waves someone is part way through in Running are both
+        listed. States are:
+
+          Ready        due for this run's phase, nobody has it
+          Interrupted  left in Running by a run that died - can be resumed
+          Busy         another engineer is running it now
+          NotDue       due for a different phase than this run
+          Complete     every VM has finished phase 3
+          Invalid      the file could not be read
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InFolder,
+        [Parameter(Mandatory)][string]$RunningFolder,
+        [ValidateRange(0, 3)][int]$Phase = 0
+    )
+
+    $files = @()
+    $files += @(Get-ChildItem -LiteralPath $InFolder -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+    if (Test-Path -LiteralPath $RunningFolder) {
+        $files += @(Get-ChildItem -LiteralPath $RunningFolder -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+    }
+
+    foreach ($file in ($files | Sort-Object Name)) {
+        $wave = [pscustomobject]@{
+            Name        = $file.Name
+            Path        = $file.FullName
+            InRunning   = ($file.DirectoryName -eq (Resolve-Path -LiteralPath $RunningFolder -ErrorAction SilentlyContinue).Path)
+            Rows        = @()
+            VMCount     = 0
+            NextPhase   = 0
+            PhaseInfo   = $null
+            State       = 'Ready'
+            StateDetail = ''
+            Marker      = $null
+            Selectable  = $true
+        }
+
+        try {
+            $wave.Rows      = @(Import-MigrationCsv -Path $file.FullName)
+            $wave.VMCount   = $wave.Rows.Count
+            $wave.PhaseInfo = Get-CsvNextPhase -Row $wave.Rows
+            $wave.NextPhase = $wave.PhaseInfo.Phase
+        }
+        catch {
+            $wave.State       = 'Invalid'
+            $wave.StateDetail = $_.Exception.Message
+            $wave.Selectable  = $false
+            $wave
+            continue
+        }
+
+        if ($wave.PhaseInfo.IsComplete) {
+            $wave.State       = 'Complete'
+            $wave.StateDetail = 'every VM has finished phase 3'
+            $wave.Selectable  = $false
+        }
+        elseif ($Phase -gt 0 -and $wave.NextPhase -ne $Phase) {
+            $wave.State       = 'NotDue'
+            $wave.StateDetail = "due for phase $($wave.NextPhase)"
+            $wave.Selectable  = $false
+        }
+
+        if ($wave.InRunning) {
+            $wave.Marker = Read-WaveRunMarker -CsvPath $file.FullName
+            if (-not $wave.Marker) {
+                $wave.State       = 'Interrupted'
+                $wave.StateDetail = 'left in Running with no marker'
+            }
+            else {
+                $alive = Test-WaveRunAlive -Marker $wave.Marker
+                $started = try { [datetime]::Parse($wave.Marker.StartedAt).ToString('yyyy-MM-dd HH:mm') } catch { 'an unknown time' }
+                if ($alive.Alive) {
+                    $wave.State       = 'Busy'
+                    $wave.StateDetail = "$($wave.Marker.Engineer) started phase $($wave.Marker.Phase) at $started ($($alive.Reason))"
+                    $wave.Selectable  = $false
+                }
+                else {
+                    $wave.State       = 'Interrupted'
+                    $wave.StateDetail = "$($wave.Marker.Engineer) started phase $($wave.Marker.Phase) at $started, then $($alive.Reason)"
+                }
+            }
+        }
+
+        $wave
+    }
+}
+
+function Show-WavePicker {
+    <#
+    .SYNOPSIS
+        Prints the available waves and asks which one to run.
+    .OUTPUTS
+        The chosen wave, or $null when the engineer chose to quit.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Wave,
+        [int]$Phase = 0
+    )
+
+    if ($Wave.Count -eq 0) {
+        Write-BulkVMotionLog -Level Warning -Message 'There are no waves to run.'
+        return $null
+    }
+
+    $heading = if ($Phase -gt 0) { "Waves available for phase $Phase" } else { 'Waves available' }
+    Write-Host ''
+    Write-Host $heading -ForegroundColor Cyan
+    Write-Host ('-' * 96) -ForegroundColor Cyan
+
+    $choices = @{}
+    $number  = 0
+    foreach ($item in $Wave) {
+        $label = '   '
+        if ($item.Selectable) {
+            $number++
+            $choices[$number] = $item
+            $label = '{0,2}.' -f $number
+        }
+
+        $colour = switch ($item.State) {
+            'Ready'       { 'Green' }
+            'Interrupted' { 'Yellow' }
+            'Busy'        { 'DarkGray' }
+            'Invalid'     { 'Red' }
+            default       { 'DarkGray' }
+        }
+
+        $detail = if ($item.StateDetail) { ' - {0}' -f $item.StateDetail } else { '' }
+        Write-Host ('{0} {1,-34} {2,3} VM(s)  phase {3}  {4}{5}' -f `
+                $label, $item.Name, $item.VMCount, $item.NextPhase, $item.State, $detail) -ForegroundColor $colour
+    }
+
+    Write-Host ('-' * 96) -ForegroundColor Cyan
+
+    if ($choices.Count -eq 0) {
+        Write-BulkVMotionLog -Level Warning -Message 'None of the waves listed can be run right now.'
+        return $null
+    }
+
+    while ($true) {
+        $answer = (Read-Host 'Which wave? (number, or Q to quit)').Trim()
+        if ($answer -in @('Q', 'q')) { return $null }
+
+        $picked = 0
+        if ([int]::TryParse($answer, [ref]$picked) -and $choices.ContainsKey($picked)) {
+            return $choices[$picked]
+        }
+        Write-Host "Enter a number between 1 and $($choices.Count), or Q to quit." -ForegroundColor Yellow
+    }
+}
+
+function Start-WaveRun {
+    <#
+    .SYNOPSIS
+        Takes a wave: moves it into Running and marks it as this engineer's.
+    .OUTPUTS
+        The wave's new path.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]$Wave,
+        [Parameter(Mandatory)][string]$RunningFolder,
+        [Parameter(Mandatory)][int]$Phase
+    )
+
+    if (-not (Test-Path -LiteralPath $RunningFolder)) {
+        New-Item -ItemType Directory -Path $RunningFolder -Force | Out-Null
+    }
+
+    $destination = Join-Path $RunningFolder $Wave.Name
+    if ($Wave.Path -ne $destination) {
+        if ($PSCmdlet.ShouldProcess($Wave.Path, "Move to $RunningFolder")) {
+            Move-Item -LiteralPath $Wave.Path -Destination $destination -Force
+        }
+    }
+
+    Write-WaveRunMarker -CsvPath $destination -Phase $Phase | Out-Null
+    return $destination
+}
+
+function Complete-WaveRun {
+    <#
+    .SYNOPSIS
+        Releases a wave when the run is done with it.
+    .DESCRIPTION
+        Every VM through the phase sends the file to Phase{N}; anything outstanding
+        sends it back to IN so it can be corrected and run again. Either way the run
+        marker goes, so the wave is no longer anyone's.
+    .OUTPUTS
+        Where the file ended up.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $marker = Get-WaveRunMarkerPath -CsvPath $Path
+    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    }
+
+    $target = Join-Path $Destination ([System.IO.Path]::GetFileName($Path))
+    if ($PSCmdlet.ShouldProcess($Path, "Move to $Destination")) {
+        Move-Item -LiteralPath $Path -Destination $target -Force
+    }
+    return $target
+}
+
+#endregion Waves
 
 #region VLAN / port group mapping -----------------------------------------------
 
@@ -554,7 +1048,7 @@ function Write-VlanPortGroupMapReport {
     foreach ($key in ($Map.Keys | Sort-Object)) {
         $names = @($Map[$key] | ForEach-Object { $_.Name })
         $level = if ($names.Count -gt 1) { 'Warning' } else { 'Info' }
-        $note  = if ($names.Count -gt 1) { ' <-- ambiguous, needs TargetPortGroup in the CSV' } else { '' }
+        $note  = if ($names.Count -gt 1) { ' <-- ambiguous, needs PhaseNPortGroups in the CSV' } else { '' }
         Write-BulkVMotionLog -Level $level -Message ('  {0,-16} -> {1}{2}' -f $key, ($names -join ', '), $note)
     }
 }
@@ -623,7 +1117,7 @@ function Resolve-TargetPortGroup {
             return $result
         }
 
-        $result.Reason = "$($SourceVlanInfo.Description) matches several target port groups ($(($candidates | ForEach-Object { $_.Name }) -join ', ')). Set TargetPortGroup in the CSV or add an entry to the port group exception map."
+        $result.Reason = "$($SourceVlanInfo.Description) matches several target port groups ($(($candidates | ForEach-Object { $_.Name }) -join ', ')). Set the port group for this adapter in the PhaseNPortGroups column, or add an entry to the port group exception map."
         return $result
     }
 
@@ -893,7 +1387,7 @@ function Get-NetworkAdapterSourcePortGroup {
         }
 
         if ($backingType -like '*OpaqueNetworkBackingInfo') {
-            throw "Adapter '$($Adapter.Name)' is connected to an opaque network (NSX). VLAN based mapping does not apply - set TargetPortGroup for this VM in the CSV."
+            throw "Adapter '$($Adapter.Name)' is connected to an opaque network (NSX). VLAN based mapping does not apply - name the port group for this adapter in the PhaseNPortGroups column."
         }
     }
 
@@ -902,6 +1396,50 @@ function Get-NetworkAdapterSourcePortGroup {
     if ($pg.Count -eq 1) { return $pg[0] }
 
     throw "The port group '$($Adapter.NetworkName)' behind adapter '$($Adapter.Name)' could not be resolved on host '$($VM.VMHost.Name)'."
+}
+
+function Get-TargetSwitchContext {
+    <#
+    .SYNOPSIS
+        Returns the VLAN table and port groups of one target distributed switch.
+    .DESCRIPTION
+        The switch is named per VM in the CSV, so a wave can land different VMs on
+        different switches. Each switch is enumerated once per run and kept in the
+        cache the caller passes in.
+    .OUTPUTS
+        PSCustomObject with Name, Map and PortGroups.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Server,
+        [Parameter(Mandatory)][hashtable]$Cache
+    )
+
+    $key = '{0}|{1}' -f $Server.Name, $Name
+    if ($Cache.ContainsKey($key)) { return $Cache[$key] }
+
+    $vds = Get-VDSwitch -Name $Name -Server $Server -ErrorAction SilentlyContinue
+    if (-not $vds) { throw "Target distributed switch '$Name' was not found on $($Server.Name)." }
+
+    # IsUplink was added in newer PowerCLI releases - probe for it rather than assume it.
+    $portGroups = @(Get-VDPortgroup -VDSwitch $vds -Server $Server | Where-Object {
+            $uplink = $_.PSObject.Properties['IsUplink']
+            -not ($uplink -and $uplink.Value)
+        })
+    if ($portGroups.Count -eq 0) { throw "Distributed switch '$Name' on $($Server.Name) has no usable port group." }
+
+    $context = [pscustomobject]@{
+        Name       = $vds.Name
+        Map        = (Get-VlanPortGroupMap -PortGroup $portGroups)
+        PortGroups = $portGroups
+    }
+
+    Write-BulkVMotionLog -Message "Target distributed switch '$($vds.Name)' on $($Server.Name):"
+    Write-VlanPortGroupMapReport -Map $context.Map
+
+    $Cache[$key] = $context
+    return $context
 }
 
 function Get-VMNetworkMigrationPlan {
@@ -920,7 +1458,9 @@ function Get-VMNetworkMigrationPlan {
         [object[]]$TargetPortGroup,
         [hashtable]$PortGroupCache = @{},
         [hashtable]$ExceptionMap = @{},
-        [string]$Override
+        # Adapter name -> port group name, from the PhaseNPortGroups cell. The key '*'
+        # applies to every adapter.
+        [hashtable]$OverrideMap = @{}
     )
 
     $adapters   = @(Get-NetworkAdapter -VM $VM -Server $Server -ErrorAction Stop)
@@ -932,10 +1472,6 @@ function Get-VMNetworkMigrationPlan {
     if ($adapters.Count -eq 0) {
         Write-BulkVMotionLog -Level Warning -VMName $VM.Name -Message 'VM has no network adapters - it will be migrated without a network change.'
         return [pscustomobject]@{ Success = $true; Adapters = @(); PortGroups = @(); Details = @(); Errors = @(); Mappings = @(); NetworkChangeNeeded = $false }
-    }
-
-    if ($Override -and $adapters.Count -gt 1) {
-        Write-BulkVMotionLog -Level Warning -VMName $VM.Name -Message "TargetPortGroup '$Override' is set but the VM has $($adapters.Count) adapters - all of them will be connected to that port group."
     }
 
     foreach ($adapter in $adapters) {
@@ -950,7 +1486,12 @@ function Get-VMNetworkMigrationPlan {
 
         $vlanInfo = Get-PortGroupVlanInfo -PortGroup $sourcePg
 
-        $pinned = $Override
+        # An entry naming this adapter wins, then one that applies to all adapters,
+        # then the port group exception map, and only then the VLAN lookup.
+        $pinned = $null
+        if ($OverrideMap.ContainsKey($adapter.Name)) { $pinned = $OverrideMap[$adapter.Name] }
+        elseif ($OverrideMap.ContainsKey('*')) { $pinned = $OverrideMap['*'] }
+
         if (-not $pinned -and $ExceptionMap.ContainsKey($sourcePg.Name)) {
             $pinned = $ExceptionMap[$sourcePg.Name]
         }
@@ -989,6 +1530,265 @@ function Get-VMNetworkMigrationPlan {
 
 #endregion vSphere inventory helpers
 
+#region Admission control -------------------------------------------------------
+
+<#
+    vSphere assigns every migration a resource cost and refuses to start one that would
+    push a host, datastore or network past its maximum - it queues it instead. Applying
+    the same arithmetic before asking vCenter keeps that queue short and predictable,
+    and means the log can say which resource a VM is waiting on.
+
+        Host       max 8   vMotion 1, Storage vMotion 4  -> 8 vMotions or 2 svMotions
+        Datastore  max 128 vMotion 1, Storage vMotion 16 -> 8 svMotions per datastore
+        Network    max 8   vMotion 1 (max 4 on 1GigE)    -> vMotion only
+#>
+
+$script:CostHostMaximum      = 8
+$script:CostDatastoreMaximum = 128
+$script:CostVMotionHost      = 1
+$script:CostVMotionDatastore = 1
+$script:CostVMotionNetwork   = 1
+$script:CostStorageHost      = 4
+$script:CostStorageDatastore = 16
+
+function New-MigrationCostLedger {
+    <#
+    .SYNOPSIS
+        Creates the running total of what is currently in flight.
+    .PARAMETER NetworkMaximum
+        8 for a 10GigE vMotion network, 4 for 1GigE.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only tracks in-memory migration cost; nothing in vSphere or on disk changes.')]
+    [CmdletBinding()]
+    param([int]$NetworkMaximum = 8)
+
+    return [pscustomobject]@{
+        HostCost       = @{}
+        DatastoreCost  = @{}
+        NetworkCost    = @{}
+        ExternalHost   = @{}
+        ExternalNetwork = @{}
+        NetworkMaximum = $NetworkMaximum
+    }
+}
+
+function Get-MigrationCost {
+    <#
+    .SYNOPSIS
+        Works out what one planned migration will cost, and where.
+    .DESCRIPTION
+        Phase 1 and phase 3 keep the VM's storage, so they are plain vMotions. Phase 2
+        is a Storage vMotion, which costs 4 on the host and 16 against each of the two
+        datastores. A cross vCenter move that also changed storage would be a "vMotion
+        without shared storage" and is costed like a Storage vMotion with a network
+        cost of 1 - that is what -TreatAsStorageMove is for.
+    .OUTPUTS
+        PSCustomObject with per resource costs, ready for Test-MigrationAdmission.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [switch]$TreatAsStorageMove
+    )
+
+    $hosts      = @{}
+    $datastores = @{}
+    $networks   = @{}
+
+    $sourceHost = $Plan.SourceHost
+    $targetHost = if ($Plan.TargetHost) { $Plan.TargetHost.Name } else { $null }
+
+    $addHost = {
+        param($Name, $Amount)
+        if (-not $Name) { return }
+        if (-not $hosts.ContainsKey($Name)) { $hosts[$Name] = 0 }
+        $hosts[$Name] += $Amount
+    }
+
+    $addDatastore = {
+        param($Name, $Amount)
+        if (-not $Name) { return }
+        if (-not $datastores.ContainsKey($Name)) { $datastores[$Name] = 0 }
+        $datastores[$Name] += $Amount
+    }
+
+    $isStorageMove = $Plan.ChangesStorage -or $TreatAsStorageMove
+
+    if ($isStorageMove) {
+        # Storage vMotion: charged to the host that owns the VM, and to both datastores.
+        & $addHost $sourceHost $script:CostStorageHost
+        & $addDatastore $Plan.SourceDatastoreName $script:CostStorageDatastore
+        & $addDatastore $Plan.DatastoreName $script:CostStorageDatastore
+
+        # Moving host and storage at once still costs 1 on the vMotion network.
+        if ($Plan.ChangesCompute) {
+            $networks[$sourceHost] = $script:CostVMotionNetwork
+            if ($targetHost -and $targetHost -ne $sourceHost) { $networks[$targetHost] = $script:CostVMotionNetwork }
+            & $addHost $targetHost $script:CostStorageHost
+        }
+    }
+    elseif ($Plan.ChangesCompute) {
+        # Plain vMotion: both ends of the move, the shared datastore, and the network.
+        & $addHost $sourceHost $script:CostVMotionHost
+        & $addHost $targetHost $script:CostVMotionHost
+        & $addDatastore $Plan.SourceDatastoreName $script:CostVMotionDatastore
+
+        $networks[$sourceHost] = $script:CostVMotionNetwork
+        if ($targetHost -and $targetHost -ne $sourceHost) { $networks[$targetHost] = $script:CostVMotionNetwork }
+    }
+
+    return [pscustomobject]@{
+        VMName     = $Plan.VMName
+        Hosts      = $hosts
+        Datastores = $datastores
+        Networks   = $networks
+        IsFree     = (($hosts.Count + $datastores.Count + $networks.Count) -eq 0)
+    }
+}
+
+function Test-MigrationAdmission {
+    <#
+    .SYNOPSIS
+        Decides whether a migration can start now without exceeding a limit.
+    .OUTPUTS
+        PSCustomObject with Allowed and, when it is not, the resource that is full.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Ledger,
+        [Parameter(Mandatory)]$Cost
+    )
+
+    # Reconnecting a port group costs nothing - there is nothing to wait for.
+    if ($Cost.IsFree) { return [pscustomobject]@{ Allowed = $true; Reason = $null } }
+
+    foreach ($name in $Cost.Hosts.Keys) {
+        $inUse = [int]$Ledger.HostCost[$name] + [int]$Ledger.ExternalHost[$name]
+        if (($inUse + $Cost.Hosts[$name]) -gt $script:CostHostMaximum) {
+            return [pscustomobject]@{
+                Allowed = $false
+                Reason  = "host '$name' is at $inUse of $($script:CostHostMaximum) migration cost"
+            }
+        }
+    }
+
+    foreach ($name in $Cost.Datastores.Keys) {
+        $inUse = [int]$Ledger.DatastoreCost[$name]
+        if (($inUse + $Cost.Datastores[$name]) -gt $script:CostDatastoreMaximum) {
+            return [pscustomobject]@{
+                Allowed = $false
+                Reason  = "datastore '$name' is at $inUse of $($script:CostDatastoreMaximum) migration cost"
+            }
+        }
+    }
+
+    foreach ($name in $Cost.Networks.Keys) {
+        $inUse = [int]$Ledger.NetworkCost[$name] + [int]$Ledger.ExternalNetwork[$name]
+        if (($inUse + $Cost.Networks[$name]) -gt $Ledger.NetworkMaximum) {
+            return [pscustomobject]@{
+                Allowed = $false
+                Reason  = "the vMotion network on '$name' is at $inUse of $($Ledger.NetworkMaximum)"
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Allowed = $true; Reason = $null }
+}
+
+function Add-MigrationCost {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ledger, [Parameter(Mandatory)]$Cost)
+
+    foreach ($name in $Cost.Hosts.Keys) { $Ledger.HostCost[$name] = [int]$Ledger.HostCost[$name] + $Cost.Hosts[$name] }
+    foreach ($name in $Cost.Datastores.Keys) { $Ledger.DatastoreCost[$name] = [int]$Ledger.DatastoreCost[$name] + $Cost.Datastores[$name] }
+    foreach ($name in $Cost.Networks.Keys) { $Ledger.NetworkCost[$name] = [int]$Ledger.NetworkCost[$name] + $Cost.Networks[$name] }
+}
+
+function Remove-MigrationCost {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only tracks in-memory migration cost; nothing in vSphere or on disk changes.')]
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ledger, [Parameter(Mandatory)]$Cost)
+
+    foreach ($name in $Cost.Hosts.Keys) {
+        $Ledger.HostCost[$name] = [math]::Max(0, [int]$Ledger.HostCost[$name] - $Cost.Hosts[$name])
+    }
+    foreach ($name in $Cost.Datastores.Keys) {
+        $Ledger.DatastoreCost[$name] = [math]::Max(0, [int]$Ledger.DatastoreCost[$name] - $Cost.Datastores[$name])
+    }
+    foreach ($name in $Cost.Networks.Keys) {
+        $Ledger.NetworkCost[$name] = [math]::Max(0, [int]$Ledger.NetworkCost[$name] - $Cost.Networks[$name])
+    }
+}
+
+function Update-ExternalMigrationCost {
+    <#
+    .SYNOPSIS
+        Charges migrations started outside this run against the same budget.
+    .DESCRIPTION
+        Several engineers migrate from the same mgmt server, so the hosts this run wants
+        to use may already be busy with someone else's wave. The running relocate tasks
+        are read from vCenter and charged to the host the VM is on.
+
+        This is deliberately approximate and errs high: the destination of another
+        session's task is not readable, so only the source side is charged, and a
+        relocate is costed as a Storage vMotion because it may well be one. vCenter
+        remains the real enforcer - this only keeps our own queue sensible.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only tracks in-memory migration cost; nothing in vSphere or on disk changes.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Ledger,
+        [Parameter(Mandatory)][object[]]$Server,
+        [string[]]$OwnTaskId = @()
+    )
+
+    $Ledger.ExternalHost.Clear()
+    $Ledger.ExternalNetwork.Clear()
+
+    foreach ($viServer in $Server) {
+        $tasks = @()
+        try {
+            $tasks = @(Get-Task -Status Running -Server $viServer -ErrorAction Stop)
+        }
+        catch {
+            Write-BulkVMotionLog -Level Debug -Message "Could not read the running tasks on $($viServer.Name): $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($task in $tasks) {
+            if ($task.Id -in $OwnTaskId) { continue }
+
+            $description = ''
+            if ($task.ExtensionData -and $task.ExtensionData.Info -and $task.ExtensionData.Info.DescriptionId) {
+                $description = [string]$task.ExtensionData.Info.DescriptionId
+            }
+            if ($description -notin @('VirtualMachine.migrate', 'VirtualMachine.relocate')) { continue }
+
+            $vm = $null
+            try { $vm = Get-VM -Id $task.ExtensionData.Info.Entity -Server $viServer -ErrorAction Stop }
+            catch { continue }
+            if (-not $vm -or -not $vm.VMHost) { continue }
+
+            $hostName = $vm.VMHost.Name
+            if ($description -eq 'VirtualMachine.relocate') {
+                $Ledger.ExternalHost[$hostName] = [int]$Ledger.ExternalHost[$hostName] + $script:CostStorageHost
+            }
+            else {
+                $Ledger.ExternalHost[$hostName] = [int]$Ledger.ExternalHost[$hostName] + $script:CostVMotionHost
+                $Ledger.ExternalNetwork[$hostName] = [int]$Ledger.ExternalNetwork[$hostName] + $script:CostVMotionNetwork
+            }
+        }
+    }
+
+    $busy = @($Ledger.ExternalHost.Keys)
+    if ($busy.Count -gt 0) {
+        $detail = @($busy | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $Ledger.ExternalHost[$_] }) -join ', '
+        Write-BulkVMotionLog -Level Debug -Message "Migrations started outside this run are using: $detail"
+    }
+}
+
+#endregion Admission control
+
 #region Migration ---------------------------------------------------------------
 
 function New-VMMigrationPlan {
@@ -1016,13 +1816,13 @@ function New-VMMigrationPlan {
         [Parameter(Mandatory)][ValidateRange(1, 3)][int]$Phase,
         [Parameter(Mandatory)]$SourceServer,
         [Parameter(Mandatory)]$TargetServer,
-        [hashtable]$VlanMap = @{},
-        [object[]]$TargetPortGroup,
+        # Switch name -> VLAN table, filled in as switches are met.
+        [hashtable]$SwitchCache = @{},
         [hashtable]$PortGroupCache = @{},
         [hashtable]$ExceptionMap = @{},
         [string]$DefaultCluster,
         [string]$DefaultDatastore,
-        [string]$DefaultFolder,
+        [string]$DefaultVDSwitch,
         [double]$DatastoreReserveGB = 0
     )
 
@@ -1039,11 +1839,12 @@ function New-VMMigrationPlan {
         TargetHost     = $null
         Datastore      = $null
         DatastoreName  = $null
-        Folder         = $null
-        FolderName     = Get-PhaseRowValue -Row $Row -PhaseColumn 'TargetFolder' -Default $DefaultFolder
+        SourceDatastoreName = $null
+        VDSwitchName   = $null
         Adapters       = @()
         PortGroups     = @()
         NetworkDetails = @()
+        Mappings       = @()
         ChangesCompute = $false
         ChangesStorage = $false
         ChangesNetwork = $false
@@ -1056,20 +1857,26 @@ function New-VMMigrationPlan {
 
     switch ($Phase) {
         1 {
-            $plan.TargetCluster = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default $DefaultCluster
-            $portGroupOverride  = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1PortGroup' -GenericColumn 'TargetPortGroup'
-            $hostOverride       = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1Host' -GenericColumn 'TargetHost'
+            $plan.TargetCluster = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1Cluster' -Default $DefaultCluster
+            $plan.VDSwitchName  = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1VDS' -Default $DefaultVDSwitch
+            $hostOverride       = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase1Host'
         }
         2 {
-            $plan.DatastoreName = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase2Datastore' -GenericColumn 'TargetDatastore' -Default $DefaultDatastore
-            $portGroupOverride  = $null
+            $plan.DatastoreName = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase2Datastore' -Default $DefaultDatastore
             $hostOverride       = $null
         }
         3 {
-            $plan.TargetCluster = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3Cluster' -GenericColumn 'TargetCluster' -Default $DefaultCluster
-            $portGroupOverride  = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3PortGroup' -GenericColumn 'TargetPortGroup'
-            $hostOverride       = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3Host' -GenericColumn 'TargetHost'
+            $plan.TargetCluster = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3Cluster' -Default $DefaultCluster
+            $plan.VDSwitchName  = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3VDS' -Default $DefaultVDSwitch
+            $hostOverride       = Get-PhaseRowValue -Row $Row -PhaseColumn 'Phase3Host'
         }
+    }
+
+    # The port groups already recorded for this phase are the engineer's overrides.
+    $overrideMap = @{}
+    $portGroupColumn = Get-PhasePortGroupColumn -Phase $Phase
+    if ($portGroupColumn) {
+        $overrideMap = ConvertFrom-PortGroupList -Value (Get-PhaseRowValue -Row $Row -PhaseColumn $portGroupColumn)
     }
 
     try {
@@ -1082,6 +1889,8 @@ function New-VMMigrationPlan {
 
     $vm = $plan.VM
     $plan.SourceHost = $vm.VMHost.Name
+    $plan.SourceDatastoreName = @(Get-Datastore -VM $vm -Server $SourceServer -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Name } | Select-Object -First 1)[0]
     $sourceCluster = Get-Cluster -VMHost $vm.VMHost -Server $SourceServer -ErrorAction SilentlyContinue
     if ($sourceCluster) { $plan.SourceCluster = $sourceCluster.Name }
 
@@ -1180,17 +1989,6 @@ function New-VMMigrationPlan {
 
     #endregion Storage
 
-    #region Destination folder ------------------------------------------------
-
-    if ($plan.FolderName) {
-        $folder = @(Get-Folder -Name $plan.FolderName -Type VM -Server $TargetServer -ErrorAction SilentlyContinue)
-        if ($folder.Count -eq 1) { $plan.Folder = $folder[0] }
-        elseif ($folder.Count -eq 0) { $plan.Errors += "Target VM folder '$($plan.FolderName)' was not found on $($TargetServer.Name)." }
-        else { $plan.Errors += "Target VM folder '$($plan.FolderName)' is ambiguous ($($folder.Count) matches) on $($TargetServer.Name)." }
-    }
-
-    #endregion Destination folder
-
     #region Networking --------------------------------------------------------
 
     if ($Phase -eq 2) {
@@ -1198,15 +1996,21 @@ function New-VMMigrationPlan {
         $plan.Adapters       = @(Get-NetworkAdapter -VM $vm -Server $SourceServer -ErrorAction SilentlyContinue)
         $plan.ChangesNetwork = $false
     }
+    elseif (-not $plan.VDSwitchName) {
+        $plan.Errors += "No target distributed switch for phase $Phase. Set Phase${Phase}VDS in the CSV or use -TargetVDSwitch."
+    }
     else {
         try {
-            $network = Get-VMNetworkMigrationPlan -VM $vm -Server $SourceServer -VlanMap $VlanMap `
-                -TargetPortGroup $TargetPortGroup -PortGroupCache $PortGroupCache `
-                -ExceptionMap $ExceptionMap -Override $portGroupOverride
+            $switch = Get-TargetSwitchContext -Name $plan.VDSwitchName -Server $TargetServer -Cache $SwitchCache
+
+            $network = Get-VMNetworkMigrationPlan -VM $vm -Server $SourceServer -VlanMap $switch.Map `
+                -TargetPortGroup $switch.PortGroups -PortGroupCache $PortGroupCache `
+                -ExceptionMap $ExceptionMap -OverrideMap $overrideMap
 
             $plan.Adapters       = $network.Adapters
             $plan.PortGroups     = $network.PortGroups
             $plan.NetworkDetails = $network.Details
+            $plan.Mappings       = $network.Mappings
             $plan.ChangesNetwork = $network.NetworkChangeNeeded
             if (-not $network.Success) { $plan.Errors += $network.Errors }
         }
@@ -1247,8 +2051,8 @@ function Write-MigrationPlanReport {
     Write-BulkVMotionLog -VMName $vmName -Message ('Source      : host {0}, cluster {1}' -f $Plan.SourceHost, $Plan.SourceCluster)
     Write-BulkVMotionLog -VMName $vmName -Message ('Destination : host {0}, cluster {1}' -f $(if ($Plan.TargetHost) { $Plan.TargetHost.Name } else { '<unresolved>' }), $Plan.TargetCluster)
     Write-BulkVMotionLog -VMName $vmName -Message ('Datastore   : {0}' -f $(if ($Plan.Datastore) { $Plan.Datastore.Name } else { '<unchanged>' }))
-    if ($Plan.FolderName) {
-        Write-BulkVMotionLog -VMName $vmName -Message ('Folder      : {0}' -f $Plan.FolderName)
+    if ($Plan.VDSwitchName) {
+        Write-BulkVMotionLog -VMName $vmName -Message ('Switch      : {0}' -f $Plan.VDSwitchName)
     }
     foreach ($detail in $Plan.NetworkDetails) {
         Write-BulkVMotionLog -VMName $vmName -Message ('Network     : {0}' -f $detail)
@@ -1275,7 +2079,7 @@ function Start-VMMigrationTask {
     param(
         [Parameter(Mandatory)]$Plan,
         [ValidateSet('Low', 'Standard', 'High')][string]$VMotionPriority = 'High',
-        [ValidateSet('Thin', 'Thick', 'EagerZeroedThick', 'AsDefined')][string]$DiskStorageFormat = 'AsDefined'
+        [ValidateSet('Thin', 'Thick', 'EagerZeroedThick', 'AsDefined')][string]$DiskStorageFormat = 'Thin'
     )
 
     # The VM is already on the right host and storage - only the adapters have to be
@@ -1319,7 +2123,6 @@ function Start-VMMigrationTask {
             $params.DiskStorageFormat = $DiskStorageFormat
         }
     }
-    if ($Plan.Folder) { $params.InventoryLocation = $Plan.Folder }
     if ($Plan.VM.PowerState -eq 'PoweredOn') { $params.VMotionPriority = $VMotionPriority }
 
     return (Move-VM @params)
@@ -1394,6 +2197,52 @@ function Wait-VMMigrationTask {
     return $stillRunning
 }
 
+function New-EmptyPlan {
+    <#
+    .SYNOPSIS
+        A plan shaped object for a VM that never got as far as being planned.
+    .DESCRIPTION
+        Used when the VM could not be resolved at all, or when a row is skipped without
+        touching vCenter. Keeping the shape identical to a real plan means the reporting
+        and write-back paths do not need to special case it.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Only tracks in-memory migration cost; nothing in vSphere or on disk changes.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$VMName,
+        [int]$CsvLine = 0,
+        [int]$Phase = 0,
+        [string[]]$ErrorMessage = @()
+    )
+
+    return [pscustomobject]@{
+        VMName              = $VMName
+        CsvLine             = $CsvLine
+        Phase               = $Phase
+        VM                  = $null
+        SourceCluster       = ''
+        SourceHost          = ''
+        TargetCluster       = ''
+        TargetHost          = $null
+        Datastore           = $null
+        DatastoreName       = ''
+        SourceDatastoreName = ''
+        VDSwitchName        = ''
+        Adapters            = @()
+        PortGroups          = @()
+        NetworkDetails      = @()
+        Mappings            = @()
+        ChangesCompute      = $false
+        ChangesStorage      = $false
+        ChangesNetwork      = $false
+        NetworkOnly         = $false
+        StorageOnly         = $false
+        AlreadyInPlace      = $false
+        Ready               = ($ErrorMessage.Count -eq 0)
+        Errors              = $ErrorMessage
+    }
+}
+
 function New-MigrationTracker {
     <#
     .SYNOPSIS
@@ -1404,6 +2253,9 @@ function New-MigrationTracker {
     param(
         [Parameter(Mandatory)]$Plan,
         $Task,
+        # What this migration is charged against the host, datastore and network
+        # budgets, so it can be released when the task finishes.
+        $Cost,
         [ValidateSet('Running', 'Success', 'Failed', 'TimedOut', 'Skipped', 'AlreadyDone')][string]$Status = 'Running',
         [string]$Message
     )
@@ -1413,6 +2265,7 @@ function New-MigrationTracker {
         CsvLine             = $Plan.CsvLine
         Plan                = $Plan
         Task                = $Task
+        Cost                = $Cost
         Status              = $Status
         Message             = $Message
         Start               = Get-Date
@@ -1458,8 +2311,29 @@ Export-ModuleMember -Function @(
     'Get-BulkVMotionLogFile'
     'Import-MigrationCsv'
     'Move-ProcessedCsv'
+    'Test-IsWindowsPlatform'
+    'Get-MigrationCredentialPath'
+    'Save-MigrationCredential'
+    'Get-MigrationCredential'
+    'Get-WaveRunMarkerPath'
+    'Write-WaveRunMarker'
+    'Read-WaveRunMarker'
+    'Test-WaveRunAlive'
+    'Get-AvailableWave'
+    'Show-WavePicker'
+    'Start-WaveRun'
+    'Complete-WaveRun'
     'Get-CsvNextPhase'
     'Get-PhaseRowValue'
+    'Get-PhasePortGroupColumn'
+    'ConvertFrom-PortGroupList'
+    'ConvertTo-PortGroupList'
+    'New-MigrationCostLedger'
+    'Get-MigrationCost'
+    'Test-MigrationAdmission'
+    'Add-MigrationCost'
+    'Remove-MigrationCost'
+    'Update-ExternalMigrationCost'
     'Update-MigrationCsv'
     'Get-PortGroupVlanInfo'
     'Get-VlanPortGroupMap'
@@ -1473,11 +2347,13 @@ Export-ModuleMember -Function @(
     'Get-VMDatastoreNotVisibleToHost'
     'Get-SourcePortGroupCache'
     'Get-NetworkAdapterSourcePortGroup'
+    'Get-TargetSwitchContext'
     'Get-VMNetworkMigrationPlan'
     'New-VMMigrationPlan'
     'Write-MigrationPlanReport'
     'Start-VMMigrationTask'
     'Wait-VMMigrationTask'
+    'New-EmptyPlan'
     'New-MigrationTracker'
     'ConvertTo-MigrationResult'
 )

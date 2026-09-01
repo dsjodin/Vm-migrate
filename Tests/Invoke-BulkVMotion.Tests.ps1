@@ -2,9 +2,9 @@
     End to end tests for Invoke-BulkVMotion.ps1.
 
     The script is run as a real child process against the PowerCLI test doubles in
-    Tests\Fakes, so the whole flow is exercised: read the CSV, settle the phase,
-    connect, build the VLAN table, plan, migrate, record the phase in the file and
-    archive it into the matching Phase folder.
+    Tests\Fakes, so the whole flow is exercised: pick the wave, claim it in Running,
+    connect, resolve each VM's switch, admit by cost, migrate, record the outcome in
+    the CSV and archive it into the matching Phase folder.
 
     Run with:  Invoke-Pester -Path .\Tests
 #>
@@ -18,17 +18,17 @@ BeforeAll {
     $script:FakeRoot   = Join-Path $PSScriptRoot 'Fakes'
     $script:PwshPath   = (Get-Process -Id $PID).Path
 
+    # The tests assert on the port group cell using the same parser the script uses.
+    Import-Module (Join-Path (Join-Path (Join-Path $script:RepoRoot 'Modules') 'BulkVMotion') 'BulkVMotion.psd1') -Force
+
     function New-TestRun {
-        <#
-            Creates an isolated IN/archive/LOGS set plus an empty config file, so a
-            settings.json in the working copy cannot influence the test.
-        #>
         param([string[]]$CsvContent, [string]$CsvName = 'wave1.csv')
 
         $root = Join-Path ([System.IO.Path]::GetTempPath()) ('bvmrun-' + [guid]::NewGuid().ToString('N'))
         $paths = [pscustomobject]@{
             Root    = $root
             In      = Join-Path $root 'IN'
+            Running = Join-Path $root 'Running'
             Archive = $root
             Logs    = Join-Path $root 'LOGS'
             Config  = Join-Path $root 'empty-config.json'
@@ -49,7 +49,8 @@ BeforeAll {
             [int]$Phase = 1,
             [string[]]$ExtraArguments = @(),
             [switch]$NoPhaseArgument,
-            [switch]$NoTargetVIServer
+            [switch]$NoTargetVIServer,
+            [string]$ExternalTasks
         )
 
         $phaseArguments = if ($NoPhaseArgument) { @() } else { @('-Phase', "$Phase") }
@@ -67,37 +68,44 @@ BeforeAll {
         $arguments = @('-NoLogo', '-NoProfile', '-File', $script:ScriptPath, '-SourceVIServer', 'vc-old.corp.local') +
         $phaseArguments + $topology + @(
             '-InFolder', $Paths.In
+            '-RunningFolder', $Paths.Running
             '-ArchiveRoot', $Paths.Archive
             '-LogFolder', $Paths.Logs
             '-ConfigFile', $Paths.Config
             '-PollIntervalSeconds', '5'
             '-DatastoreReserveGB', '10'
+            '-NonInteractive'
         ) + $ExtraArguments
 
-        $previousModulePath = $env:PSModulePath
-        $previousFakeLog    = $env:BVM_FAKE_LOG
-        $previousFakeState  = $env:BVM_FAKE_STATE
+        $previous = @{
+            ModulePath = $env:PSModulePath
+            FakeLog    = $env:BVM_FAKE_LOG
+            FakeState  = $env:BVM_FAKE_STATE
+            External   = $env:BVM_EXTERNAL_TASKS
+        }
         try {
-            $env:PSModulePath   = $script:FakeRoot + [System.IO.Path]::PathSeparator + $previousModulePath
-            $env:BVM_FAKE_LOG   = $Paths.FakeLog
+            $env:PSModulePath       = $script:FakeRoot + [System.IO.Path]::PathSeparator + $previous.ModulePath
+            $env:BVM_FAKE_LOG       = $Paths.FakeLog
             # Each phase is its own process, so the inventory has to persist between them.
-            $env:BVM_FAKE_STATE = $Paths.State
+            $env:BVM_FAKE_STATE     = $Paths.State
+            $env:BVM_EXTERNAL_TASKS = $ExternalTasks
             $output = & $script:PwshPath @arguments 2>&1
             return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output | Out-String) }
         }
         finally {
-            $env:PSModulePath   = $previousModulePath
-            $env:BVM_FAKE_LOG   = $previousFakeLog
-            $env:BVM_FAKE_STATE = $previousFakeState
+            $env:PSModulePath       = $previous.ModulePath
+            $env:BVM_FAKE_LOG       = $previous.FakeLog
+            $env:BVM_FAKE_STATE     = $previous.FakeState
+            $env:BVM_EXTERNAL_TASKS = $previous.External
         }
     }
 
-    function Get-InFiles { param($Paths) @(Get-ChildItem -LiteralPath $Paths.In -File -ErrorAction SilentlyContinue) }
+    function Get-InFiles      { param($Paths) @(Get-ChildItem -LiteralPath $Paths.In -File -ErrorAction SilentlyContinue) }
+    function Get-RunningFiles { param($Paths) @(Get-ChildItem -LiteralPath $Paths.Running -File -ErrorAction SilentlyContinue) }
 
     function Get-PhaseFiles {
         param($Paths, [int]$Phase)
-        $folder = Join-Path $Paths.Archive ('Phase{0}' -f $Phase)
-        @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue)
+        @(Get-ChildItem -LiteralPath (Join-Path $Paths.Archive ('Phase{0}' -f $Phase)) -File -ErrorAction SilentlyContinue)
     }
 
     function Get-ArchivedCsv {
@@ -119,6 +127,35 @@ BeforeAll {
         if (-not (Test-Path -LiteralPath $Paths.FakeLog)) { return @() }
         return @(Get-Content -LiteralPath $Paths.FakeLog)
     }
+
+    function Get-PeakConcurrency {
+        <#
+            Replays the START/END lines the fake recorded and returns the highest number
+            of simultaneous operations of one kind that any single host ever carried.
+        #>
+        param($Paths, [string]$Operation)
+
+        $inFlight = @{}
+        $peak     = @{}
+        $owner    = @{}
+
+        foreach ($line in (Get-Calls -Paths $Paths)) {
+            if ($line -match '^START (?<vm>\S+) (?<host>\S+) (?<op>\S+)$') {
+                if ($Matches.op -ne $Operation) { continue }
+                $vmHost = $Matches.host
+                $owner[$Matches.vm] = $vmHost
+                $inFlight[$vmHost] = [int]$inFlight[$vmHost] + 1
+                if ([int]$inFlight[$vmHost] -gt [int]$peak[$vmHost]) { $peak[$vmHost] = $inFlight[$vmHost] }
+            }
+            elseif ($line -match '^END (?<vm>\S+)$') {
+                $vmHost = $owner[$Matches.vm]
+                if ($vmHost) { $inFlight[$vmHost] = [math]::Max(0, [int]$inFlight[$vmHost] - 1) }
+            }
+        }
+
+        if ($peak.Count -eq 0) { return 0 }
+        return (($peak.Values | Measure-Object -Maximum).Maximum)
+    }
 }
 
 Describe 'Phase 1 - cluster change and VDS remap' {
@@ -129,7 +166,7 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         }
     }
 
-    It 'vMotions to the new cluster, remaps the port groups by VLAN and leaves storage alone' {
+    It 'vMotions to the new cluster, remaps by VLAN and leaves storage alone' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-app-02')
 
         $run = Invoke-Runner -Paths $script:Paths -Phase 1
@@ -139,27 +176,26 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         $calls = (Get-Calls -Paths $script:Paths) -join "`n"
         $calls | Should -Match 'MOVE vm-app-01 -> host=esx-new-\d+\.corp\.local datastore=none portgroups=PG-NEW-Prod-100'
         $calls | Should -Match 'MOVE vm-app-02 .*portgroups=PG-NEW-Test-200'
-
         # datastore=none is the point of phase 1: the disks do not move.
         $calls | Should -Not -Match 'datastore=DS-'
     }
 
-    It 'records the phase in the CSV and archives it into Phase1' {
+    It 'records the phase, the engineer and the port groups, then archives into Phase1' {
         $script:Paths = New-TestRun -CsvContent @('VMName,Notes', 'vm-app-01,first wave')
 
         Invoke-Runner -Paths $script:Paths -Phase 1 | Out-Null
 
         (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 0
+        (Get-InFiles -Paths $script:Paths).Count      | Should -Be 0
+        (Get-RunningFiles -Paths $script:Paths).Count | Should -Be 0
 
         $archived = Get-ArchivedCsv -Paths $script:Paths -Phase 1 | Select-Object -First 1
-        $archived.PhaseCompleted  | Should -Be '1'
-        $archived.ResultCluster   | Should -Be 'CL-NEW-01'
-        $archived.ResultHost      | Should -Match '^esx-new-\d+\.corp\.local$'
-        $archived.ResultPortGroup | Should -Be 'PG-NEW-Prod-100'
-        $archived.CompletedAt     | Should -Not -BeNullOrEmpty
-        # The operator's own columns survive.
-        $archived.Notes           | Should -Be 'first wave'
+        $archived.PhaseCompleted   | Should -Be '1'
+        $archived.CompletedBy      | Should -Not -BeNullOrEmpty
+        $archived.ResultCluster    | Should -Be 'CL-NEW-01'
+        $archived.ResultHost       | Should -Match '^esx-new-\d+\.corp\.local$'
+        $archived.Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100'
+        $archived.Notes            | Should -Be 'first wave'
     }
 
     It 'refuses a VM whose datastore the new cluster cannot see' {
@@ -173,35 +209,32 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
     }
 
-    It 'keeps the file in IN when a VM cannot be mapped, and completes it on the re-run' {
+    It 'keeps the wave in IN when a VM cannot be mapped, and finishes it on the re-run' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-dmz-01')
 
         $first = Invoke-Runner -Paths $script:Paths -Phase 1
         $first.ExitCode | Should -Be 1
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
+        (Get-InFiles -Paths $script:Paths).Count      | Should -Be 1
+        (Get-RunningFiles -Paths $script:Paths).Count | Should -Be 0
 
-        # vm-app-01 migrated and is now recorded in the file that stayed behind.
         $inProgress = @(Import-Csv -LiteralPath $script:Paths.Csv)
         ($inProgress | Where-Object { $_.VMName -eq 'vm-app-01' }).PhaseCompleted | Should -Be '1'
         ($inProgress | Where-Object { $_.VMName -eq 'vm-dmz-01' }).PhaseCompleted | Should -Be '0'
 
-        # Fix the failing row the way an operator would, then run the same file again.
+        # Pin the port group the way an engineer would, then run the wave again.
         $fixed = $inProgress | ForEach-Object {
-            $value = if ($_.VMName -eq 'vm-dmz-01') { 'PG-NEW-Test-200' } else { '' }
-            $_ | Add-Member -NotePropertyName 'Phase1PortGroup' -NotePropertyValue $value -Force -PassThru
+            $value = if ($_.VMName -eq 'vm-dmz-01') { 'Network adapter 1=PG-NEW-Test-200' } else { '' }
+            $_ | Add-Member -NotePropertyName 'Phase1PortGroups' -NotePropertyValue $value -Force -PassThru
         }
         $fixed | Export-Csv -LiteralPath $script:Paths.Csv -NoTypeInformation
 
         $second = Invoke-Runner -Paths $script:Paths -Phase 1
         $second.ExitCode | Should -Be 0
 
-        # Only the outstanding VM was touched on the re-run.
         $calls = (Get-Calls -Paths $script:Paths) -join "`n"
         @([regex]::Matches($calls, 'MOVE vm-app-01')).Count | Should -Be 1
         $calls | Should -Match 'MOVE vm-dmz-01 .*portgroups=PG-NEW-Test-200'
-
         (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 0
     }
 
     It 'reports a VM an earlier run already moved without touching it' {
@@ -225,16 +258,104 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         $calls | Should -Match 'SETNIC vm-netonly-01 Network adapter 1 -> PG-NEW-Prod-100'
         $calls | Should -Not -Match 'MOVE '
     }
+}
 
-    It 'migrates nothing and leaves the file untouched with -ValidateOnly' {
+Describe 'Multiple NICs and per VM switches' {
+
+    AfterEach {
+        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
+            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'maps each NIC onto the port group carrying its own VLAN' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-multinic-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        # VLAN 100 and VLAN 300 land on different port groups, in adapter order.
+        (Get-Calls -Paths $script:Paths) -join "`n" |
+            Should -Match 'MOVE vm-multinic-01 .*portgroups=PG-NEW-Prod-100\+PG-NEW-Bkp-300'
+    }
+
+    It 'records both NICs in one cell and reads them back as overrides' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-multinic-01')
+
+        Invoke-Runner -Paths $script:Paths -Phase 1 | Out-Null
+
+        $archived = Get-ArchivedCsv -Paths $script:Paths -Phase 1 | Select-Object -First 1
+        $archived.Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300'
+
+        # That same cell, fed back in, has to pin both adapters.
+        $map = ConvertFrom-PortGroupList -Value $archived.Phase1PortGroups
+        $map['Network adapter 1'] | Should -Be 'PG-NEW-Prod-100'
+        $map['Network adapter 2'] | Should -Be 'PG-NEW-Bkp-300'
+    }
+
+    It 'honours a per adapter override that names only the second NIC' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1PortGroups'
+            'vm-multinic-01,Network adapter 2=PG-NEW-Test-200'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        # Adapter 1 still resolved by VLAN; adapter 2 went where the cell said.
+        (Get-Calls -Paths $script:Paths) -join "`n" |
+            Should -Match 'portgroups=PG-NEW-Prod-100\+PG-NEW-Test-200'
+    }
+
+    It 'sends two VMs in one wave to the switches their rows name' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1VDS'
+            'vm-multinic-01,VDS-NEW'
+            'vm-multinic-02,VDS-NEW-B'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        $calls = (Get-Calls -Paths $script:Paths) -join "`n"
+        $calls | Should -Match 'MOVE vm-multinic-01 .*portgroups=PG-NEW-Prod-100\+PG-NEW-Bkp-300'
+        $calls | Should -Match 'MOVE vm-multinic-02 .*portgroups=PG-B-Prod-100\+PG-B-Bkp-300'
+    }
+}
+
+Describe 'Dry run' {
+
+    AfterEach {
+        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
+            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fills in the port groups it resolved without migrating or archiving' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-multinic-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1 -ExtraArguments @('-ValidateOnly')
+
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths).Count       | Should -Be 0
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 0
+        (Get-RunningFiles -Paths $script:Paths).Count | Should -Be 0
+        (Get-InFiles -Paths $script:Paths).Count      | Should -Be 1
+
+        $row = @(Import-Csv -LiteralPath $script:Paths.Csv)[0]
+        $row.Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300'
+        # The phase is untouched: nothing was actually done.
+        $row.PhaseCompleted   | Should -Be '0'
+    }
+
+    It 'leaves the wave ready to run for real straight afterwards' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
-        $before = Get-Content -LiteralPath $script:Paths.Csv -Raw
 
         Invoke-Runner -Paths $script:Paths -Phase 1 -ExtraArguments @('-ValidateOnly') | Out-Null
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
 
-        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
-        Get-Content -LiteralPath $script:Paths.Csv -Raw | Should -Be $before
+        $run.ExitCode | Should -Be 0
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
     }
 }
 
@@ -246,7 +367,7 @@ Describe 'Phase 2 - storage only' {
         }
     }
 
-    It 'Storage vMotions without naming a destination host or touching the network' {
+    It 'Storage vMotions thin, without a destination host or a network change' {
         $script:Paths = New-TestRun -CsvContent @(
             'VMName,PhaseCompleted,Phase2Datastore'
             'vm-phase1-01,1,DS-NEW-01'
@@ -255,25 +376,57 @@ Describe 'Phase 2 - storage only' {
         $run = Invoke-Runner -Paths $script:Paths -Phase 2
 
         $run.ExitCode | Should -Be 0
-
         $calls = (Get-Calls -Paths $script:Paths) -join "`n"
-        # No destination host and no port groups - this is a pure svMotion.
         $calls | Should -Match 'MOVE vm-phase1-01 -> host=none datastore=DS-NEW-01 portgroups=none'
         $calls | Should -Not -Match 'SETNIC'
     }
 
-    It 'archives into Phase2 and records the datastore the VM landed on' {
+    It 'holds the third Storage vMotion on a host until one of the first two finishes' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase2Datastore'
+            'vm-phase1-01,1,DS-NEW-01'
+            'vm-phase1-02,1,DS-NEW-01'
+            'vm-phase1-03,1,DS-NEW-01'
+            'vm-phase1-04,1,DS-NEW-01'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2
+
+        $run.ExitCode | Should -Be 0
+        # All four are on esx-new-01, and a host carries at most 2 Storage vMotions.
+        @(Get-Calls -Paths $script:Paths | Where-Object { $_ -like 'MOVE *' }).Count | Should -Be 4
+        Get-PeakConcurrency -Paths $script:Paths -Operation 'svmotion' | Should -BeLessOrEqual 2
+    }
+
+    It 'gives way to Storage vMotions another engineer already has on that host' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase2Datastore'
+            'vm-phase1-01,1,DS-NEW-01'
+            'vm-phase1-02,1,DS-NEW-01'
+        )
+
+        # Someone else is already running two Storage vMotions on esx-new-01, which uses
+        # the host's whole budget of 8.
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2 -ExternalTasks 'vm-phase1-03=relocate;vm-phase1-04=relocate'
+
+        # Nothing can start and nothing is running, so the run says so rather than hanging.
+        $run.Output | Should -Match 'blocked by a resource limit|Blocked by a resource limit'
+        (Get-Calls -Paths $script:Paths | Where-Object { $_ -like 'MOVE *' }).Count | Should -Be 0
+        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
+    }
+
+    It 'ignores other engineers when told to' {
         $script:Paths = New-TestRun -CsvContent @(
             'VMName,PhaseCompleted,Phase2Datastore'
             'vm-phase1-01,1,DS-NEW-01'
         )
 
-        Invoke-Runner -Paths $script:Paths -Phase 2 | Out-Null
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2 `
+            -ExternalTasks 'vm-phase1-03=relocate;vm-phase1-04=relocate' `
+            -ExtraArguments @('-IgnoreExternalTasks')
 
-        (Get-PhaseFiles -Paths $script:Paths -Phase 2).Count | Should -Be 1
-        $archived = Get-ArchivedCsv -Paths $script:Paths -Phase 2 | Select-Object -First 1
-        $archived.PhaseCompleted  | Should -Be '2'
-        $archived.ResultDatastore | Should -Be 'DS-NEW-01'
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-phase1-01'
     }
 
     It 'fails the VM when no target datastore is given' {
@@ -283,19 +436,6 @@ Describe 'Phase 2 - storage only' {
 
         $run.ExitCode | Should -Be 1
         (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message | Should -Match 'target datastore is required'
-    }
-
-    It 'reports a VM that is already on the target datastore' {
-        $script:Paths = New-TestRun -CsvContent @(
-            'VMName,PhaseCompleted,Phase2Datastore'
-            'vm-phase2-01,1,DS-NEW-01'
-        )
-
-        $run = Invoke-Runner -Paths $script:Paths -Phase 2
-
-        $run.ExitCode | Should -Be 0
-        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
-        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Status | Should -Be 'AlreadyDone'
     }
 }
 
@@ -307,30 +447,27 @@ Describe 'Phase 3 - cross vCenter, same storage' {
         }
     }
 
-    It 'moves to the new vCenter keeping the same datastore and remapping onto its VDS' {
+    It 'moves to the new vCenter keeping the datastore and remapping onto its VDS' {
         $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase2-01,2')
 
         $run = Invoke-Runner -Paths $script:Paths -Phase 3
 
         $run.ExitCode | Should -Be 0
-
-        # The datastore is passed unchanged - same shared LUN as the new vCenter sees it -
-        # and the port group is the second vCenter's, matched on VLAN 100 again.
         (Get-Calls -Paths $script:Paths) -join "`n" |
             Should -Match 'MOVE vm-phase2-01 -> host=esx-vc2-\d+\.corp\.local datastore=DS-NEW-01 portgroups=PG-VC2-Prod-100'
     }
 
-    It 'archives into Phase3 and records the new vCenter' {
+    It 'records the new vCenter and its port groups, and archives into Phase3' {
         $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase2-01,2')
 
         Invoke-Runner -Paths $script:Paths -Phase 3 | Out-Null
 
-        (Get-PhaseFiles -Paths $script:Paths -Phase 3).Count | Should -Be 1
         $archived = Get-ArchivedCsv -Paths $script:Paths -Phase 3 | Select-Object -First 1
-        $archived.PhaseCompleted  | Should -Be '3'
-        $archived.ResultVIServer  | Should -Be 'vc-new.corp.local'
-        $archived.ResultCluster   | Should -Be 'CL-FINAL-01'
-        $archived.ResultDatastore | Should -Be 'DS-NEW-01'
+        $archived.PhaseCompleted   | Should -Be '3'
+        $archived.ResultVIServer   | Should -Be 'vc-new.corp.local'
+        $archived.ResultCluster    | Should -Be 'CL-FINAL-01'
+        $archived.ResultDatastore  | Should -Be 'DS-NEW-01'
+        $archived.Phase3PortGroups | Should -Be 'Network adapter 1=PG-VC2-Prod-100'
     }
 
     It 'refuses to run without a target vCenter' {
@@ -341,79 +478,8 @@ Describe 'Phase 3 - cross vCenter, same storage' {
         $run.ExitCode | Should -Be 2
         $run.Output   | Should -Match '-TargetVIServer is required'
     }
-}
-
-Describe 'Phase handling across a whole wave' {
-
-    AfterEach {
-        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
-            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    It 'refuses a file that is due for a different phase than the run' {
-        $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase1-01,1')
-
-        # The file has phase 1 behind it, so it is due for phase 2, not phase 1.
-        $run = Invoke-Runner -Paths $script:Paths -Phase 1
-
-        $run.ExitCode | Should -Be 1
-        $run.Output   | Should -Match 'due for phase 2 but the run was started with -Phase 1'
-        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
-    }
-
-    It 'takes the phase from the file when -Phase is not given' {
-        $script:Paths = New-TestRun -CsvContent @(
-            'VMName,PhaseCompleted,Phase2Datastore'
-            'vm-phase1-01,1,DS-NEW-01'
-        )
-
-        $run = Invoke-Runner -Paths $script:Paths -Phase 2 -NoPhaseArgument
-
-        $run.ExitCode | Should -Be 0
-        $run.Output   | Should -Match 'Phase\s+: 2 \(taken from the CSV files\)'
-        (Get-PhaseFiles -Paths $script:Paths -Phase 2).Count | Should -Be 1
-    }
-
-    It 'carries one file through all three phases' {
-        $script:Paths = New-TestRun -CsvContent @('VMName,Phase2Datastore', 'vm-app-01,DS-NEW-01')
-
-        # Phase 1: old cluster -> new cluster, new VDS.
-        (Invoke-Runner -Paths $script:Paths -Phase 1).ExitCode | Should -Be 0
-        $afterPhase1 = Get-PhaseFiles -Paths $script:Paths -Phase 1 | Select-Object -First 1
-        $afterPhase1 | Should -Not -BeNullOrEmpty
-
-        # The VM really is in the new cluster on the new VDS now, still on its old storage.
-        (Import-Csv -LiteralPath $afterPhase1.FullName)[0].ResultPortGroup | Should -Be 'PG-NEW-Prod-100'
-
-        # The operator brings the file back for the storage wave.
-        Move-Item -LiteralPath $afterPhase1.FullName -Destination $script:Paths.Csv
-
-        (Invoke-Runner -Paths $script:Paths -Phase 2).ExitCode | Should -Be 0
-        $afterPhase2 = Get-PhaseFiles -Paths $script:Paths -Phase 2 | Select-Object -First 1
-        $afterPhase2 | Should -Not -BeNullOrEmpty
-        (Import-Csv -LiteralPath $afterPhase2.FullName)[0].PhaseCompleted | Should -Be '2'
-
-        # And again for the cross vCenter wave.
-        Move-Item -LiteralPath $afterPhase2.FullName -Destination $script:Paths.Csv
-
-        (Invoke-Runner -Paths $script:Paths -Phase 3).ExitCode | Should -Be 0
-        $final = Get-ArchivedCsv -Paths $script:Paths -Phase 3 | Select-Object -First 1
-        $final.PhaseCompleted | Should -Be '3'
-        $final.ResultVIServer | Should -Be 'vc-new.corp.local'
-        # Phase 3 kept the storage phase 2 put it on - the shared LUN, not the old one.
-        $final.ResultDatastore | Should -Be 'DS-NEW-01'
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 0
-
-        $calls = (Get-Calls -Paths $script:Paths) -join "`n"
-        $calls | Should -Match 'MOVE vm-app-01 -> host=esx-new-\d+\.corp\.local datastore=none portgroups=PG-NEW-Prod-100'
-        $calls | Should -Match 'MOVE vm-app-01 -> host=none datastore=DS-NEW-01 portgroups=none'
-        $calls | Should -Match 'MOVE vm-app-01 -> host=esx-vc2-\d+\.corp\.local datastore=DS-NEW-01 portgroups=PG-VC2-Prod-100'
-    }
 
     It 'refuses phase 3 when the VM never had its storage moved in phase 2' {
-        # Still on DS-OLD-01, which the new vCenter cannot see.
         $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase1-01,2')
 
         $run = Invoke-Runner -Paths $script:Paths -Phase 3
@@ -422,47 +488,151 @@ Describe 'Phase handling across a whole wave' {
         (Get-Calls -Paths $script:Paths).Count | Should -Be 0
         (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message |
             Should -Match "Datastore 'DS-OLD-01' was not found on vc-new.corp.local"
+    }
+}
+
+Describe 'Waves on a shared mgmt server' {
+
+    AfterEach {
+        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
+            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'refuses a wave that is due for a different phase than the run' {
+        $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase1-01,1')
+
+        # The wave has phase 1 behind it, so it is due for phase 2, not phase 1.
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 2
+        $run.Output   | Should -Match 'needs exactly one runnable wave'
+        (Get-Calls -Paths $script:Paths).Count   | Should -Be 0
         (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
     }
 
-    It 'reports a finished wave that is dropped back into IN and re-archives it' {
-        $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase2-01,3')
+    It 'runs the wave named with -CsvFile without the picker' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+        @('VMName', 'vm-app-02') -join "`n" | Set-Content -LiteralPath (Join-Path $script:Paths.In 'wave2.csv')
 
-        $run = Invoke-Runner -Paths $script:Paths -Phase 3 -NoPhaseArgument
+        # Two runnable waves, so -NonInteractive alone would refuse; naming one is how a
+        # scripted run picks.
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1 -ExtraArguments @('-CsvFile', (Join-Path $script:Paths.In 'wave2.csv'))
 
-        $run.Output | Should -Match 'every VM has completed phase 3'
-        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
-        (Get-PhaseFiles -Paths $script:Paths -Phase 3).Count | Should -Be 1
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-app-02'
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Not -Match 'MOVE vm-app-01'
+        # wave1 was left alone for whoever wants it.
+        (Get-InFiles -Paths $script:Paths).Name | Should -Be 'wave1.csv'
     }
 
-    It 'reports a broken CSV and leaves it in IN' {
-        $script:Paths = New-TestRun -CsvContent @('Name,TargetCluster', 'vm-app-01,CL-NEW-01')
-
-        $run = Invoke-Runner -Paths $script:Paths -Phase 1
-
-        $run.ExitCode | Should -Be 1
-        $run.Output   | Should -Match 'missing required column'
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
-    }
-
-    It 'records a failed vCenter task and keeps the file for a retry' {
-        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-fail-task')
-
-        $run = Invoke-Runner -Paths $script:Paths -Phase 1
-
-        $run.ExitCode | Should -Be 1
-        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 0
-        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message | Should -Match 'not compatible'
-    }
-
-    It 'processes several files in one wave' {
+    It 'refuses to guess when several waves could be run' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
         @('VMName', 'vm-app-02') -join "`n" | Set-Content -LiteralPath (Join-Path $script:Paths.In 'wave2.csv')
 
         $run = Invoke-Runner -Paths $script:Paths -Phase 1
 
+        $run.ExitCode | Should -Be 2
+        $run.Output   | Should -Match 'needs exactly one runnable wave, but there are 2'
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+    }
+
+    It 'will not touch a wave another engineer is running' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+
+        # Move it into Running and claim it for a live process that is not ours.
+        New-Item -ItemType Directory -Path $script:Paths.Running -Force | Out-Null
+        $claimed = Join-Path $script:Paths.Running 'wave1.csv'
+        Move-Item -LiteralPath $script:Paths.Csv -Destination $claimed
+        @{
+            Engineer = 'CORP\bob'; Machine = $env:COMPUTERNAME; ProcessId = $PID
+            ProcessStartedAt = (Get-Process -Id $PID).StartTime.ToString('o')
+            StartedAt = (Get-Date).ToString('o'); Phase = 1; Wave = 'wave1.csv'
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:Paths.Running 'wave1.run.json')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 2
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+        # Still theirs, untouched.
+        (Get-RunningFiles -Paths $script:Paths).Name | Should -Contain 'wave1.csv'
+    }
+
+    It 'resumes a wave left behind by a run that died' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+
+        New-Item -ItemType Directory -Path $script:Paths.Running -Force | Out-Null
+        $stranded = Join-Path $script:Paths.Running 'wave1.csv'
+        Move-Item -LiteralPath $script:Paths.Csv -Destination $stranded
+        @{
+            Engineer = 'CORP\bob'; Machine = $env:COMPUTERNAME; ProcessId = 999999
+            ProcessStartedAt = (Get-Date).AddHours(-2).ToString('o')
+            StartedAt = (Get-Date).AddHours(-2).ToString('o'); Phase = 1; Wave = 'wave1.csv'
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:Paths.Running 'wave1.run.json')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
         $run.ExitCode | Should -Be 0
-        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 2
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 0
+        $run.Output   | Should -Match 'Resuming a wave that was interrupted'
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-app-01'
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
+        (Get-RunningFiles -Paths $script:Paths).Count        | Should -Be 0
+    }
+
+    It 'never leaves a wave stranded in Running when the run fails' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-fail-task')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-RunningFiles -Paths $script:Paths).Count | Should -Be 0
+        (Get-InFiles -Paths $script:Paths).Count      | Should -Be 1
+    }
+
+    It 'names the log after the engineer who ran it' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+
+        Invoke-Runner -Paths $script:Paths -Phase 1 | Out-Null
+
+        $log = Get-ChildItem -LiteralPath $script:Paths.Logs -Filter '*.log' | Select-Object -First 1
+        $log.Name | Should -BeLike "*$env:USERNAME*"
+    }
+
+    It 'reports a broken CSV and leaves it in IN' {
+        $script:Paths = New-TestRun -CsvContent @('Name,Cluster', 'vm-app-01,CL-NEW-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 2
+        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
+    }
+
+    It 'carries one wave through all three phases' {
+        $script:Paths = New-TestRun -CsvContent @('VMName,Phase2Datastore', 'vm-app-01,DS-NEW-01')
+
+        (Invoke-Runner -Paths $script:Paths -Phase 1).ExitCode | Should -Be 0
+        $afterPhase1 = Get-PhaseFiles -Paths $script:Paths -Phase 1 | Select-Object -First 1
+        (Import-Csv -LiteralPath $afterPhase1.FullName)[0].Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100'
+
+        Move-Item -LiteralPath $afterPhase1.FullName -Destination $script:Paths.Csv
+        (Invoke-Runner -Paths $script:Paths -Phase 2).ExitCode | Should -Be 0
+        $afterPhase2 = Get-PhaseFiles -Paths $script:Paths -Phase 2 | Select-Object -First 1
+        (Import-Csv -LiteralPath $afterPhase2.FullName)[0].PhaseCompleted | Should -Be '2'
+
+        Move-Item -LiteralPath $afterPhase2.FullName -Destination $script:Paths.Csv
+        (Invoke-Runner -Paths $script:Paths -Phase 3).ExitCode | Should -Be 0
+
+        $final = Get-ArchivedCsv -Paths $script:Paths -Phase 3 | Select-Object -First 1
+        $final.PhaseCompleted   | Should -Be '3'
+        $final.ResultVIServer   | Should -Be 'vc-new.corp.local'
+        $final.ResultDatastore  | Should -Be 'DS-NEW-01'
+        # Each phase recorded its own port groups.
+        $final.Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100'
+        $final.Phase3PortGroups | Should -Be 'Network adapter 1=PG-VC2-Prod-100'
+
+        $calls = (Get-Calls -Paths $script:Paths) -join "`n"
+        $calls | Should -Match 'MOVE vm-app-01 -> host=esx-new-\d+\.corp\.local datastore=none portgroups=PG-NEW-Prod-100'
+        $calls | Should -Match 'MOVE vm-app-01 -> host=none datastore=DS-NEW-01 portgroups=none'
+        $calls | Should -Match 'MOVE vm-app-01 -> host=esx-vc2-\d+\.corp\.local datastore=DS-NEW-01 portgroups=PG-VC2-Prod-100'
     }
 }

@@ -19,6 +19,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSupportsShouldProcess', '', Justification = 'Test double: -Confirm is declared to match the real PowerCLI cmdlets.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Test double: no state is changed.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUsePSCredentialType', '', Justification = 'Test double: the credential is never used.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Test double: the helper returns a collection of tasks.')]
 param()
 
 class VirtualEthernetCardDistributedVirtualPortBackingInfo { $Port }
@@ -100,6 +101,15 @@ $script:VMs = @{
     'vm-phase1-01'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
         Adapters = @((script:New-Adapter -VMName 'vm-phase1-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
 
+    # Three more on the same host, so a phase 2 wave has to queue behind the 2 per host
+    # Storage vMotion limit.
+    'vm-phase1-02'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-phase1-02' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+    'vm-phase1-03'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-phase1-03' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+    'vm-phase1-04'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-phase1-04' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+
     # Phase 2 done: new cluster, new VDS, new storage - ready for the cross vCenter move.
     'vm-phase2-01'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
         Adapters = @((script:New-Adapter -VMName 'vm-phase2-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
@@ -107,6 +117,20 @@ $script:VMs = @{
     # In the new cluster but still on the old VDS port group.
     'vm-netonly-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
         Adapters = @((script:New-Adapter -VMName 'vm-netonly-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
+
+    # Two NICs on different VLANs - each has to land on its own port group.
+    'vm-multinic-01' = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 50
+        Adapters = @(
+            (script:New-Adapter -VMName 'vm-multinic-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')
+            (script:New-Adapter -VMName 'vm-multinic-01' -Name 'Network adapter 2' -NetworkName 'PG-OLD-Bkp-300' -PortgroupKey 'dvpg-old-300')
+        ) }
+
+    # Same again, for the wave that sends VMs to two different switches.
+    'vm-multinic-02' = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 50
+        Adapters = @(
+            (script:New-Adapter -VMName 'vm-multinic-02' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')
+            (script:New-Adapter -VMName 'vm-multinic-02' -Name 'Network adapter 2' -NetworkName 'PG-OLD-Bkp-300' -PortgroupKey 'dvpg-old-300')
+        ) }
 
     # On storage the new cluster cannot see - phase 1 must refuse this one.
     'vm-nosan-01'   = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-ISOLATED'; UsedSpaceGB = 30
@@ -168,6 +192,32 @@ function script:Write-FakeLog {
     if ($env:BVM_FAKE_LOG) { Add-Content -LiteralPath $env:BVM_FAKE_LOG -Value $Line }
 }
 
+# Migrations other engineers have started, seeded by $env:BVM_EXTERNAL_TASKS as
+# "<vmname>=<migrate|relocate>" entries separated by semicolons.
+function script:Get-ExternalTasks {
+    if (-not $env:BVM_EXTERNAL_TASKS) { return @() }
+
+    $result = @()
+    foreach ($entry in ($env:BVM_EXTERNAL_TASKS -split ';')) {
+        $part = $entry.Trim()
+        if (-not $part) { continue }
+        $split = $part.Split('=')
+        $vmName = $split[0].Trim()
+        $kind = if ($split.Count -gt 1) { $split[1].Trim() } else { 'migrate' }
+        $result += [pscustomobject]@{
+            Id            = "Task-external-$vmName"
+            State         = 'Running'
+            ExtensionData = [pscustomobject]@{
+                Info = [pscustomobject]@{
+                    DescriptionId = "VirtualMachine.$kind"
+                    Entity        = $vmName
+                }
+            }
+        }
+    }
+    return $result
+}
+
 function Connect-VIServer {
     [CmdletBinding()]
     param([string]$Server, [System.Management.Automation.PSCredential]$Credential)
@@ -186,9 +236,11 @@ function Set-PowerCLIConfiguration {
 
 function Get-VM {
     [CmdletBinding()]
-    param([string]$Name, $Server)
+    param([string]$Name, $Id, $Server)
 
-    if (-not $script:VMs.ContainsKey($Name)) { return @() }
+    # A task entity resolves back to a VM.
+    if ($Id) { $Name = [string]$Id }
+    if (-not $Name -or -not $script:VMs.ContainsKey($Name)) { return @() }
 
     return [pscustomobject]@{
         Name          = $Name
@@ -297,6 +349,14 @@ function Move-VM {
         $(if ($Datastore) { $Datastore.Name } else { 'none' }),
         $(if ($PortGroup) { (($PortGroup | ForEach-Object { $_.Name }) -join '+') } else { 'none' }))
 
+    # The host and operation are recorded on start and on finish, so a test can work out
+    # the highest concurrency that was ever reached on any one host.
+    $operation = if ($Datastore -and -not $Destination) { 'svmotion' }
+    elseif ($Datastore -and $Destination -and $Datastore.Name -ne $script:VMs[$VM.Name].Datastore) { 'svmotion' }
+    else { 'vmotion' }
+    $costHost = if ($Destination) { $Destination.Name } else { $script:VMs[$VM.Name].Host }
+    script:Write-FakeLog -Line ('START {0} {1} {2}' -f $VM.Name, $costHost, $operation)
+
     # Apply the migration to the inventory, so the next phase sees where the VM ended up.
     if ($Destination) { $script:VMs[$VM.Name].Host = $Destination.Name }
     if ($Datastore) { $script:VMs[$VM.Name].Datastore = $Datastore.Name }
@@ -326,7 +386,11 @@ function Move-VM {
 
 function Get-Task {
     [CmdletBinding()]
-    param([string]$Id, $Server)
+    param([string]$Id, [string]$Status, $Server)
+
+    if (-not $Id -and $Status -eq 'Running') {
+        return @(script:Get-ExternalTasks) + @($script:Tasks.Values | Where-Object { $_.State -eq 'Running' })
+    }
 
     if (-not $script:Tasks.ContainsKey($Id)) { return $null }
 
@@ -342,6 +406,7 @@ function Get-Task {
             $task.State = 'Success'
             $task.PercentComplete = 100
         }
+        script:Write-FakeLog -Line ('END {0}' -f $task.VMName)
     }
     return $task
 }

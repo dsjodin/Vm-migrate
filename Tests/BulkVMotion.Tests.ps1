@@ -7,6 +7,7 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Test helper names read better in the plural.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Test helpers build fixtures; there is nothing to confirm.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'A throwaway password for a fake credential object; it never reaches a real system.')]
 param()
 
 BeforeAll {
@@ -223,35 +224,36 @@ Describe 'Import-MigrationCsv' {
 
     It 'returns one normalised row per VM with every known column present' {
         $path = Join-Path $script:TestRoot 'wave1.csv'
-        "VMName,TargetCluster`nvm-app-01,CL-NEW-01`nvm-app-02,CL-NEW-01" | Set-Content -LiteralPath $path
+        "VMName,Phase1Cluster`nvm-app-01,CL-NEW-01`nvm-app-02,CL-NEW-01" | Set-Content -LiteralPath $path
 
         $rows = @(Import-MigrationCsv -Path $path)
 
-        $rows.Count              | Should -Be 2
-        $rows[0].VMName          | Should -Be 'vm-app-01'
-        $rows[0].TargetCluster   | Should -Be 'CL-NEW-01'
-        $rows[0].TargetDatastore | Should -Be ''
-        $rows[0].CsvLine         | Should -Be 2
-        $rows[1].CsvLine         | Should -Be 3
+        $rows.Count               | Should -Be 2
+        $rows[0].VMName           | Should -Be 'vm-app-01'
+        $rows[0].Phase1Cluster    | Should -Be 'CL-NEW-01'
+        $rows[0].Phase2Datastore  | Should -Be ''
+        $rows[0].Phase1PortGroups | Should -Be ''
+        $rows[0].CsvLine          | Should -Be 2
+        $rows[1].CsvLine          | Should -Be 3
     }
 
     It 'trims whitespace around values' {
         $path = Join-Path $script:TestRoot 'spaces.csv'
-        "VMName,TargetCluster`n  vm-app-01  ,  CL-NEW-01  " | Set-Content -LiteralPath $path
+        "VMName,Phase1Cluster`n  vm-app-01  ,  CL-NEW-01  " | Set-Content -LiteralPath $path
 
         (Import-MigrationCsv -Path $path).VMName | Should -Be 'vm-app-01'
     }
 
     It 'throws when the VMName column is missing' {
         $path = Join-Path $script:TestRoot 'bad.csv'
-        "Name,TargetCluster`nvm-app-01,CL-NEW-01" | Set-Content -LiteralPath $path
+        "Name,Phase1Cluster`nvm-app-01,CL-NEW-01" | Set-Content -LiteralPath $path
 
         { Import-MigrationCsv -Path $path } | Should -Throw '*missing required column*'
     }
 
     It 'throws when the file has no data rows' {
         $path = Join-Path $script:TestRoot 'empty.csv'
-        'VMName,TargetCluster' | Set-Content -LiteralPath $path
+        'VMName,Phase1Cluster' | Set-Content -LiteralPath $path
 
         { Import-MigrationCsv -Path $path } | Should -Throw '*no data rows*'
     }
@@ -262,7 +264,7 @@ Describe 'Import-MigrationCsv' {
 
     It 'skips rows with an empty VMName' {
         $path = Join-Path $script:TestRoot 'gap.csv'
-        "VMName,TargetCluster`nvm-app-01,CL-NEW-01`n,CL-NEW-01" | Set-Content -LiteralPath $path
+        "VMName,Phase1Cluster`nvm-app-01,CL-NEW-01`n,CL-NEW-01" | Set-Content -LiteralPath $path
 
         @(Import-MigrationCsv -Path $path).Count | Should -Be 1
     }
@@ -402,18 +404,15 @@ Describe 'Get-CsvNextPhase' {
 
 Describe 'Get-PhaseRowValue' {
 
-    It 'prefers the phase column over the generic one and the default' {
-        $row = [pscustomobject]@{ Phase1Cluster = 'CL-PHASE'; TargetCluster = 'CL-GENERIC' }
+    It 'prefers the phase column over the run default' {
+        $row = [pscustomobject]@{ Phase1Cluster = 'CL-PHASE' }
 
-        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-PHASE'
+        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -Default 'CL-DEFAULT' | Should -Be 'CL-PHASE'
     }
 
-    It 'falls back to the generic column, then to the run default' {
-        $row = [pscustomobject]@{ Phase1Cluster = ''; TargetCluster = 'CL-GENERIC' }
-        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-GENERIC'
-
-        $empty = [pscustomobject]@{ Phase1Cluster = ''; TargetCluster = '' }
-        Get-PhaseRowValue -Row $empty -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-DEFAULT'
+    It 'falls back to the run default when the cell is empty' {
+        $row = [pscustomobject]@{ Phase1Cluster = '' }
+        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -Default 'CL-DEFAULT' | Should -Be 'CL-DEFAULT'
     }
 
     It 'copes with a column the file does not have at all' {
@@ -466,8 +465,9 @@ Describe 'Update-MigrationCsv' {
         $rows[0].VMName | Should -Be 'vm-a'
         $rows[1].VMName | Should -Be 'vm-b'
         $rows[1].Notes  | Should -Be 'and me'
-        # Every row carries every column, so Export-Csv cannot drop one.
-        $rows[0].PSObject.Properties.Name | Should -Contain 'ResultCluster'
+        # Every row carries every column that was written, so Export-Csv cannot drop one.
+        $rows[0].PSObject.Properties.Name | Should -Contain 'PhaseCompleted'
+        $rows[0].PSObject.Properties.Name | Should -Contain 'CompletedAt'
     }
 
     It 'does nothing when there is nothing to record' {
@@ -512,5 +512,411 @@ Describe 'Import-MigrationCsv phase column' {
         "VMName,PhaseCompleted`nvm-a,later" | Set-Content -LiteralPath $path
 
         { Import-MigrationCsv -Path $path } | Should -Throw '*invalid PhaseCompleted*'
+    }
+}
+
+Describe 'Port group lists' {
+
+    It 'parses adapter=portgroup pairs, whatever the spacing' {
+        $map = ConvertFrom-PortGroupList -Value 'Network adapter 1=PG-Prod-100;Network adapter 2 = PG-Bkp-300 '
+
+        $map.Count                     | Should -Be 2
+        $map['Network adapter 1']      | Should -Be 'PG-Prod-100'
+        $map['Network adapter 2']      | Should -Be 'PG-Bkp-300'
+    }
+
+    It 'treats a bare value as applying to every adapter' {
+        (ConvertFrom-PortGroupList -Value 'PG-Solo')['*'] | Should -Be 'PG-Solo'
+    }
+
+    It 'returns an empty map for an empty cell' {
+        (ConvertFrom-PortGroupList -Value '').Count  | Should -Be 0
+        (ConvertFrom-PortGroupList -Value $null).Count | Should -Be 0
+    }
+
+    It 'renders the resolved mappings back into one cell' {
+        $mappings = @(
+            [pscustomobject]@{ AdapterName = 'Network adapter 1'; TargetName = 'PG-Prod-100' }
+            [pscustomobject]@{ AdapterName = 'Network adapter 2'; TargetName = 'PG-Bkp-300' }
+        )
+
+        ConvertTo-PortGroupList -Mapping $mappings | Should -Be 'Network adapter 1=PG-Prod-100; Network adapter 2=PG-Bkp-300'
+    }
+
+    It 'round trips' {
+        $mappings = @(
+            [pscustomobject]@{ AdapterName = 'Network adapter 1'; TargetName = 'PG-A' }
+            [pscustomobject]@{ AdapterName = 'Network adapter 2'; TargetName = 'PG-B' }
+        )
+        $map = ConvertFrom-PortGroupList -Value (ConvertTo-PortGroupList -Mapping $mappings)
+
+        $map['Network adapter 1'] | Should -Be 'PG-A'
+        $map['Network adapter 2'] | Should -Be 'PG-B'
+    }
+
+    It 'names the port group column for each phase' {
+        Get-PhasePortGroupColumn -Phase 1 | Should -Be 'Phase1PortGroups'
+        Get-PhasePortGroupColumn -Phase 2 | Should -BeNullOrEmpty
+        Get-PhasePortGroupColumn -Phase 3 | Should -Be 'Phase3PortGroups'
+    }
+}
+
+Describe 'Migration cost model' {
+
+    BeforeAll {
+        function New-CostPlan {
+            param(
+                [string]$VMName = 'vm-a',
+                [string]$SourceHost = 'esx-01',
+                [string]$TargetHost = 'esx-02',
+                [string]$SourceDatastore = 'DS-A',
+                [string]$TargetDatastore = 'DS-B',
+                [switch]$Storage,
+                [switch]$Compute
+            )
+            $plan = New-EmptyPlan -VMName $VMName
+            $plan.SourceHost          = $SourceHost
+            $plan.TargetHost          = [pscustomobject]@{ Name = $TargetHost }
+            $plan.SourceDatastoreName = $SourceDatastore
+            $plan.DatastoreName       = $TargetDatastore
+            $plan.ChangesStorage      = [bool]$Storage
+            $plan.ChangesCompute      = [bool]$Compute
+            return $plan
+        }
+    }
+
+    It 'costs a vMotion 1 on each host, 1 on the datastore and 1 on the network' {
+        $cost = Get-MigrationCost -Plan (New-CostPlan -Compute)
+
+        $cost.Hosts['esx-01']      | Should -Be 1
+        $cost.Hosts['esx-02']      | Should -Be 1
+        $cost.Datastores['DS-A']   | Should -Be 1
+        $cost.Networks['esx-01']   | Should -Be 1
+        $cost.Networks['esx-02']   | Should -Be 1
+    }
+
+    It 'costs a Storage vMotion 4 on the host and 16 against each datastore' {
+        $cost = Get-MigrationCost -Plan (New-CostPlan -Storage -TargetHost 'esx-01')
+
+        $cost.Hosts['esx-01']    | Should -Be 4
+        $cost.Datastores['DS-A'] | Should -Be 16
+        $cost.Datastores['DS-B'] | Should -Be 16
+        # A Storage vMotion does not use the vMotion network.
+        $cost.Networks.Count     | Should -Be 0
+    }
+
+    It 'costs nothing when there is nothing to move' {
+        (Get-MigrationCost -Plan (New-CostPlan)).IsFree | Should -BeTrue
+    }
+
+    It 'allows 8 vMotions on a host and holds the 9th' {
+        $ledger = New-MigrationCostLedger
+        for ($i = 1; $i -le 8; $i++) {
+            $cost = Get-MigrationCost -Plan (New-CostPlan -VMName "vm-$i" -SourceHost 'esx-01' -TargetHost "esx-spread-$i" -Compute)
+            (Test-MigrationAdmission -Ledger $ledger -Cost $cost).Allowed | Should -BeTrue
+            Add-MigrationCost -Ledger $ledger -Cost $cost
+        }
+
+        $ninth = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-9' -SourceHost 'esx-01' -TargetHost 'esx-spread-9' -Compute)
+        $verdict = Test-MigrationAdmission -Ledger $ledger -Cost $ninth
+        $verdict.Allowed | Should -BeFalse
+        $verdict.Reason  | Should -Match "host 'esx-01' is at 8 of 8"
+    }
+
+    It 'allows 2 Storage vMotions on a host and holds the 3rd until one finishes' {
+        $ledger = New-MigrationCostLedger
+
+        $first  = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-1' -SourceHost 'esx-01' -TargetHost 'esx-01' -TargetDatastore 'DS-1' -Storage)
+        $second = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-2' -SourceHost 'esx-01' -TargetHost 'esx-01' -TargetDatastore 'DS-2' -Storage)
+        $third  = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-3' -SourceHost 'esx-01' -TargetHost 'esx-01' -TargetDatastore 'DS-3' -Storage)
+
+        Add-MigrationCost -Ledger $ledger -Cost $first
+        Add-MigrationCost -Ledger $ledger -Cost $second
+
+        (Test-MigrationAdmission -Ledger $ledger -Cost $third).Allowed | Should -BeFalse
+
+        # One finishes and the third can go.
+        Remove-MigrationCost -Ledger $ledger -Cost $first
+        (Test-MigrationAdmission -Ledger $ledger -Cost $third).Allowed | Should -BeTrue
+    }
+
+    It 'allows 8 Storage vMotions against one datastore and holds the 9th' {
+        $ledger = New-MigrationCostLedger
+
+        for ($i = 1; $i -le 8; $i++) {
+            $cost = Get-MigrationCost -Plan (New-CostPlan -VMName "vm-$i" -SourceHost "esx-$i" -TargetHost "esx-$i" -SourceDatastore "DS-src-$i" -TargetDatastore 'DS-SHARED' -Storage)
+            (Test-MigrationAdmission -Ledger $ledger -Cost $cost).Allowed | Should -BeTrue
+            Add-MigrationCost -Ledger $ledger -Cost $cost
+        }
+
+        $ninth = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-9' -SourceHost 'esx-9' -TargetHost 'esx-9' -SourceDatastore 'DS-src-9' -TargetDatastore 'DS-SHARED' -Storage)
+        $verdict = Test-MigrationAdmission -Ledger $ledger -Cost $ninth
+        $verdict.Allowed | Should -BeFalse
+        $verdict.Reason  | Should -Match "datastore 'DS-SHARED' is at 128 of 128"
+    }
+
+    It 'binds on the vMotion network at 4 on a 1GigE estate' {
+        $ledger = New-MigrationCostLedger -NetworkMaximum 4
+
+        for ($i = 1; $i -le 4; $i++) {
+            $cost = Get-MigrationCost -Plan (New-CostPlan -VMName "vm-$i" -SourceHost 'esx-01' -TargetHost "esx-dest-$i" -Compute)
+            Add-MigrationCost -Ledger $ledger -Cost $cost
+        }
+
+        $fifth = Get-MigrationCost -Plan (New-CostPlan -VMName 'vm-5' -SourceHost 'esx-01' -TargetHost 'esx-dest-5' -Compute)
+        $verdict = Test-MigrationAdmission -Ledger $ledger -Cost $fifth
+
+        # The host limit is 8, so it is the network that stops this one.
+        $verdict.Allowed | Should -BeFalse
+        $verdict.Reason  | Should -Match 'vMotion network'
+    }
+
+    It 'releases capacity when a migration finishes' {
+        $ledger = New-MigrationCostLedger
+        $cost = Get-MigrationCost -Plan (New-CostPlan -SourceHost 'esx-01' -TargetHost 'esx-01' -Storage)
+
+        Add-MigrationCost -Ledger $ledger -Cost $cost
+        $ledger.HostCost['esx-01'] | Should -Be 4
+
+        Remove-MigrationCost -Ledger $ledger -Cost $cost
+        $ledger.HostCost['esx-01'] | Should -Be 0
+    }
+
+    It 'counts another engineer''s migrations against the same host budget' {
+        $ledger = New-MigrationCostLedger
+        # Two Storage vMotions someone else started have used the host's whole budget.
+        $ledger.ExternalHost['esx-01'] = 8
+
+        $cost = Get-MigrationCost -Plan (New-CostPlan -SourceHost 'esx-01' -TargetHost 'esx-02' -Compute)
+        (Test-MigrationAdmission -Ledger $ledger -Cost $cost).Allowed | Should -BeFalse
+    }
+}
+
+Describe 'Wave state' {
+
+    BeforeEach {
+        $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('bvm-' + [guid]::NewGuid().ToString('N'))
+        $script:InDir      = Join-Path $script:TestRoot 'IN'
+        $script:RunningDir = Join-Path $script:TestRoot 'Running'
+        New-Item -ItemType Directory -Path $script:InDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $script:RunningDir -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'lists a fresh wave as ready for phase 1' {
+        "VMName`nvm-a`nvm-b" | Set-Content -LiteralPath (Join-Path $script:InDir 'wave1.csv')
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)
+
+        $wave.Count       | Should -Be 1
+        $wave[0].State    | Should -Be 'Ready'
+        $wave[0].VMCount  | Should -Be 2
+        $wave[0].NextPhase | Should -Be 1
+        $wave[0].Selectable | Should -BeTrue
+    }
+
+    It 'marks a wave due for another phase as not selectable' {
+        "VMName,PhaseCompleted`nvm-a,1" | Set-Content -LiteralPath (Join-Path $script:InDir 'wave1.csv')
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)[0]
+
+        $wave.State       | Should -Be 'NotDue'
+        $wave.StateDetail | Should -Match 'due for phase 2'
+        $wave.Selectable  | Should -BeFalse
+    }
+
+    It 'reports a wave another live run has claimed as busy' {
+        $csv = Join-Path $script:RunningDir 'wave1.csv'
+        "VMName`nvm-a" | Set-Content -LiteralPath $csv
+        Write-WaveRunMarker -CsvPath $csv -Phase 1 | Out-Null
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)[0]
+
+        # The marker names this very process, so the run is alive.
+        $wave.State      | Should -Be 'Busy'
+        $wave.Selectable | Should -BeFalse
+        $wave.StateDetail | Should -Match $env:USERNAME
+    }
+
+    It 'reports a wave whose run has died as interrupted and resumable' {
+        $csv = Join-Path $script:RunningDir 'wave1.csv'
+        "VMName`nvm-a" | Set-Content -LiteralPath $csv
+        Write-WaveRunMarker -CsvPath $csv -Phase 1 | Out-Null
+
+        # Point the marker at a process id that cannot be running.
+        $markerPath = Get-WaveRunMarkerPath -CsvPath $csv
+        $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+        $marker.ProcessId = 999999
+        $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)[0]
+
+        $wave.State       | Should -Be 'Interrupted'
+        $wave.StateDetail | Should -Match 'the process is gone'
+        $wave.Selectable  | Should -BeTrue
+    }
+
+    It 'spots a recycled process id rather than believing the run is alive' {
+        $csv = Join-Path $script:RunningDir 'wave1.csv'
+        "VMName`nvm-a" | Set-Content -LiteralPath $csv
+        Write-WaveRunMarker -CsvPath $csv -Phase 1 | Out-Null
+
+        # Same (live) process id, but the process started at a different time.
+        $markerPath = Get-WaveRunMarkerPath -CsvPath $csv
+        $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+        $marker.ProcessStartedAt = (Get-Date).AddDays(-3).ToString('o')
+        $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath
+
+        (Test-WaveRunAlive -Marker (Read-WaveRunMarker -CsvPath $csv)).Alive | Should -BeFalse
+    }
+
+    It 'assumes a wave claimed from another machine is still running' {
+        $csv = Join-Path $script:RunningDir 'wave1.csv'
+        "VMName`nvm-a" | Set-Content -LiteralPath $csv
+        Write-WaveRunMarker -CsvPath $csv -Phase 1 | Out-Null
+
+        $markerPath = Get-WaveRunMarkerPath -CsvPath $csv
+        $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+        $marker.Machine   = 'OTHER-MGMT-01'
+        $marker.ProcessId = 999999
+        $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath
+
+        $alive = Test-WaveRunAlive -Marker (Read-WaveRunMarker -CsvPath $csv)
+        $alive.Alive  | Should -BeTrue
+        $alive.Reason | Should -Match 'OTHER-MGMT-01'
+    }
+
+    It 'reports a wave that cannot be read as invalid rather than throwing' {
+        "Name,Cluster`nvm-a,CL" | Set-Content -LiteralPath (Join-Path $script:InDir 'broken.csv')
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)[0]
+
+        $wave.State      | Should -Be 'Invalid'
+        $wave.Selectable | Should -BeFalse
+    }
+
+    It 'releases a wave into the phase folder and removes the marker' {
+        $csv = Join-Path $script:RunningDir 'wave1.csv'
+        "VMName`nvm-a" | Set-Content -LiteralPath $csv
+        Write-WaveRunMarker -CsvPath $csv -Phase 1 | Out-Null
+
+        $destination = Join-Path $script:TestRoot 'Phase1'
+        $landed = Complete-WaveRun -Path $csv -Destination $destination
+
+        Test-Path -LiteralPath $landed | Should -BeTrue
+        Test-Path -LiteralPath $csv    | Should -BeFalse
+        Test-Path -LiteralPath (Get-WaveRunMarkerPath -CsvPath $csv) | Should -BeFalse
+    }
+}
+
+Describe 'Credentials' {
+
+    BeforeEach {
+        $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('bvm-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:TestRoot -Force | Out-Null
+        $script:PreviousHome = $env:BVM_CREDENTIAL_HOME
+        $env:BVM_CREDENTIAL_HOME = $script:TestRoot
+    }
+
+    AfterEach {
+        $env:BVM_CREDENTIAL_HOME = $script:PreviousHome
+        Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'keeps each vCenter under the engineer''s own profile' {
+        $path = Get-MigrationCredentialPath -VIServer 'VC-Old.Corp.Local'
+
+        $path | Should -BeLike (Join-Path $script:TestRoot '*')
+        # The name is normalised, so casing cannot produce two files for one vCenter.
+        [System.IO.Path]::GetFileName($path) | Should -Be 'vc-old.corp.local.cred.xml'
+    }
+
+    It 'uses the credential passed on the command line ahead of anything stored' {
+        $explicit = [pscredential]::new('DOMAIN\alice', (ConvertTo-SecureString 'pw' -AsPlainText -Force))
+
+        (Get-MigrationCredential -VIServer 'vc.corp.local' -Credential $explicit).UserName | Should -Be 'DOMAIN\alice'
+    }
+
+    It 'returns nothing rather than prompting when told not to prompt' {
+        Get-MigrationCredential -VIServer 'vc.corp.local' -NoPrompt | Should -BeNullOrEmpty
+    }
+
+    It 'refuses to store a credential where the password would not be encrypted' {
+        # Export-Clixml only encrypts a SecureString on Windows, so the guard only has
+        # anything to do elsewhere. The check runs here, not at discovery time, because
+        # the module is not loaded yet when Pester evaluates -Skip.
+        if (Test-IsWindowsPlatform) {
+            Set-ItResult -Skipped -Because 'the guard only applies off Windows'
+            return
+        }
+
+        $credential = [pscredential]::new('u', (ConvertTo-SecureString 'p' -AsPlainText -Force))
+
+        { Save-MigrationCredential -VIServer 'vc.corp.local' -Credential $credential } |
+            Should -Throw '*only be stored on Windows*'
+    }
+}
+
+Describe 'Show-WavePicker' {
+
+    BeforeAll {
+        function New-PickerWave {
+            param([string]$Name, [string]$State = 'Ready', [bool]$Selectable = $true, [int]$NextPhase = 1)
+            [pscustomobject]@{
+                Name = $Name; Path = "/tmp/$Name"; VMCount = 3; NextPhase = $NextPhase
+                State = $State; StateDetail = ''; Selectable = $Selectable
+            }
+        }
+    }
+
+    It 'returns the wave whose number the engineer typed' {
+        Mock -ModuleName BulkVMotion Read-Host { '2' }
+
+        $chosen = Show-WavePicker -Phase 1 -Wave @(
+            (New-PickerWave -Name 'wave1.csv'), (New-PickerWave -Name 'wave2.csv')
+        )
+
+        $chosen.Name | Should -Be 'wave2.csv'
+    }
+
+    It 'numbers only the waves that can be run' {
+        # wave1 is busy, so typing 1 has to pick wave2.
+        Mock -ModuleName BulkVMotion Read-Host { '1' }
+
+        $chosen = Show-WavePicker -Phase 1 -Wave @(
+            (New-PickerWave -Name 'wave1.csv' -State 'Busy' -Selectable $false)
+            (New-PickerWave -Name 'wave2.csv')
+        )
+
+        $chosen.Name | Should -Be 'wave2.csv'
+    }
+
+    It 'returns nothing when the engineer quits' {
+        Mock -ModuleName BulkVMotion Read-Host { 'Q' }
+
+        Show-WavePicker -Phase 1 -Wave @((New-PickerWave -Name 'wave1.csv')) | Should -BeNullOrEmpty
+    }
+
+    It 'asks again after an answer that is not a listed number' {
+        $script:answers = @('99', 'nonsense', '1')
+        $script:index = 0
+        Mock -ModuleName BulkVMotion Read-Host { $value = $script:answers[$script:index]; $script:index++; $value }
+
+        $chosen = Show-WavePicker -Phase 1 -Wave @((New-PickerWave -Name 'wave1.csv'))
+
+        $chosen.Name    | Should -Be 'wave1.csv'
+        $script:index   | Should -Be 3
+    }
+
+    It 'returns nothing when there is nothing runnable' {
+        Show-WavePicker -Phase 1 -Wave @((New-PickerWave -Name 'wave1.csv' -State 'Busy' -Selectable $false)) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'returns nothing when there are no waves at all' {
+        Show-WavePicker -Phase 1 -Wave @() | Should -BeNullOrEmpty
     }
 }

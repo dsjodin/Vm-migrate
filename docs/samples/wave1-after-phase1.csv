@@ -1,5 +1,5 @@
-VMName,SourceCluster,Phase1Cluster,Phase1PortGroup,Phase2Datastore,Phase3Cluster,Phase3PortGroup,Notes,PhaseCompleted,CompletedAt,ResultVIServer,ResultCluster,ResultHost,ResultDatastore,ResultPortGroup
-vm-app-01,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,Port groups found by VLAN in both phase 1 and phase 3,1,2026-09-01 21:14:02,vc.corp.local,CL-NEW-01,esx-new-03.corp.local,,PG-NEW-Prod-100
-vm-app-02,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,,1,2026-09-01 21:19:47,vc.corp.local,CL-NEW-01,esx-new-01.corp.local,,PG-NEW-Test-200
-vm-db-01,CL-OLD-01,CL-NEW-01,,DS-NEW-SQL-01,CL-FINAL-01,,Its own datastore in phase 2,1,2026-09-01 21:26:11,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,,PG-NEW-Prod-100
-vm-dmz-01,CL-OLD-02,CL-NEW-02,PG-NEW-DMZ-Web,DSC-NEW-DMZ,CL-FINAL-02,PG-VC2-DMZ-Web,VLAN is ambiguous on both new switches so the port groups are named,1,2026-09-01 21:31:55,vc.corp.local,CL-NEW-02,esx-new-11.corp.local,,PG-NEW-DMZ-Web
+VMName,SourceCluster,Phase1Cluster,Phase1VDS,Phase2Datastore,Phase3Cluster,Phase3VDS,Notes,Phase1PortGroups,PhaseCompleted,CompletedAt,CompletedBy,ResultVIServer,ResultCluster,ResultHost,ResultDatastore
+vm-app-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,,Network adapter 1=PG-NEW-Prod-100,1,2026-09-01 21:14:02,dsjodin,vc.corp.local,CL-NEW-01,esx-new-03.corp.local,
+vm-app-02,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,,Network adapter 1=PG-NEW-Prod-100,1,2026-09-01 21:19:47,dsjodin,vc.corp.local,CL-NEW-01,esx-new-01.corp.local,
+vm-db-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DS-NEW-SQL-01,CL-FINAL-01,VDS-VC2-01,Its own datastore in phase 2,Network adapter 1=PG-NEW-SQL-110,1,2026-09-01 21:26:11,dsjodin,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,
+vm-web-01,CL-OLD-02,CL-NEW-02,VDS-NEW-02,DSC-NEW-DMZ,CL-FINAL-02,VDS-VC2-02,Two NICs on different VLANs,Network adapter 1=PG-NEW-DMZ-200; Network adapter 2=PG-NEW-Bkp-300,1,2026-09-01 21:31:55,akarlsson,vc.corp.local,CL-NEW-02,esx-new-11.corp.local,

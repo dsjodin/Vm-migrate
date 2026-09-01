@@ -1,17 +1,17 @@
 {
-  "_comment": "Copy to config/settings.json to avoid retyping the standing arguments. Anything passed on the command line overrides what is set here. The phase specific values are the ones you change between waves.",
+  "_comment": "Copy to config/settings.json to avoid retyping the standing arguments. Anything passed on the command line overrides what is set here. Credentials are NOT stored here - each engineer runs Save-MigrationCredential.ps1 once.",
 
   "SourceVIServer": "vc.corp.local",
+  "TargetVIServer": "vc-new.corp.local",
 
   "TargetVDSwitch": [ "VDS-NEW-01" ],
   "DefaultTargetCluster": "CL-NEW-01",
 
-  "MaxConcurrentMigrations": 2,
+  "VMotionNetworkLimit": 8,
   "MigrationTimeoutMinutes": 120,
   "PollIntervalSeconds": 15,
   "VMotionPriority": "High",
-  "DiskStorageFormat": "AsDefined",
+  "DiskStorageFormat": "Thin",
   "DatastoreReserveGB": 100,
-  "MoveCsvWhen": "AllSuccess",
   "LogLevel": "Info"
 }

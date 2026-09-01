@@ -1,5 +1,5 @@
-VMName,SourceCluster,Phase1Cluster,Phase1PortGroup,Phase2Datastore,Phase3Cluster,Phase3PortGroup,Notes
-vm-app-01,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,Port groups found by VLAN in both phase 1 and phase 3
-vm-app-02,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,
-vm-db-01,CL-OLD-01,CL-NEW-01,,DS-NEW-SQL-01,CL-FINAL-01,,Its own datastore in phase 2
-vm-dmz-01,CL-OLD-02,CL-NEW-02,PG-NEW-DMZ-Web,DSC-NEW-DMZ,CL-FINAL-02,PG-VC2-DMZ-Web,VLAN is ambiguous on both new switches so the port groups are named
+VMName,SourceCluster,Phase1Cluster,Phase1VDS,Phase2Datastore,Phase3Cluster,Phase3VDS,Notes
+vm-app-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,
+vm-app-02,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,
+vm-db-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DS-NEW-SQL-01,CL-FINAL-01,VDS-VC2-01,Its own datastore in phase 2
+vm-web-01,CL-OLD-02,CL-NEW-02,VDS-NEW-02,DSC-NEW-DMZ,CL-FINAL-02,VDS-VC2-02,Two NICs on different VLANs
