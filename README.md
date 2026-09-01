@@ -75,11 +75,11 @@ Which wave? (number, or Q to quit):
 
 The wave you pick moves into `Running/` with a marker naming you, your machine and the
 process, so nobody else can start it. When the run ends it goes to `Phase{N}` (all done)
-or back to `IN` (something outstanding) — including if the run crashes, because the
+or back to `IN` (something outstanding) - including if the run crashes, because the
 release happens in the script's `finally`. A wave left behind by a run that really died
 is offered back as **Interrupted**; resuming it skips the VMs that got through.
 
-`-CsvFile` names a wave directly and skips the picker. `-NonInteractive` never prompts —
+`-CsvFile` names a wave directly and skips the picker. `-NonInteractive` never prompts:
 it runs the only available wave, or fails if there is more than one.
 
 ## The CSV
@@ -96,9 +96,9 @@ run's `-DefaultTargetCluster` / `-DefaultTargetDatastore` / `-TargetVDSwitch`.
 | `Phase2Datastore` | 2 | Datastore or datastore cluster to move onto |
 | `Phase3Cluster` | 3 | Cluster on the new vCenter |
 | `Phase3VDS` | 3 | Distributed switch on the new vCenter |
-| `Notes` | – | Free text, never touched |
+| `Notes` | - | Free text, never touched |
 
-The script fills these in — do not write them by hand:
+The script fills these in - do not write them by hand:
 
 | Column | Meaning |
 | --- | --- |
@@ -122,7 +122,7 @@ For every adapter of every VM, in phases 1 and 3:
 2. its VLAN is read from the port group configuration,
 3. the port group on that VM's target VDS carrying the same VLAN is chosen.
 
-A VM with several NICs on different VLANs is handled per adapter — each lands on the port
+A VM with several NICs on different VLANs is handled per adapter - each lands on the port
 group for its own VLAN, and all of them are recorded in one cell.
 
 Access VLANs, trunk ranges and private VLANs are kept apart: a trunk never matches a plain
@@ -144,7 +144,7 @@ asks vCenter for something vCenter would only queue:
 | --- | --- | --- | --- |
 | Host | 8 | 1 | 4 |
 | Datastore | 128 | 1 | 16 against each of source and destination |
-| vMotion network | 8 | 1 | – |
+| vMotion network | 8 | 1 | - |
 
 Which gives the familiar derived limits: **8 vMotions or 2 Storage vMotions per host**, and
 **8 Storage vMotions per datastore**. When a VM has to wait, the log says which resource is
@@ -153,12 +153,12 @@ full.
 Migrations *other engineers* have started are counted too: the running relocate tasks are
 read from vCenter each polling cycle and charged against the same budget, so two people
 running waves at once share the estate properly. That accounting is deliberately
-approximate and errs high — another session's destination is not readable, so only the
+approximate and errs high - another session's destination is not readable, so only the
 source host is charged, and a relocate is costed as a Storage vMotion. `-IgnoreExternalTasks`
 turns it off.
 
 > **Network speed:** VMware tiers the network limit at 1GigE (max 4) and 10GigE (max 8)
-> only — there is no higher tier, so 10GigE, 25GigE and 100GigE all cap at 8, and the host
+> only - there is no higher tier, so 10GigE, 25GigE and 100GigE all cap at 8, and the host
 > limit of 8 binds first anyway. Leave `-VMotionNetworkLimit` at 8 unless your vMotion
 > network is 1GigE, in which case set it to 4.
 
@@ -181,7 +181,7 @@ are migrated. Nothing has to be edited out by hand.
 | `-StopOnError` | off | Stop starting new migrations as soon as one VM fails |
 | `-DatastoreReserveGB` | 100 | Free space that must remain on the target datastore (phase 2) |
 | `-DiskStorageFormat` | `Thin` | Applied only when disks actually move |
-| `-CsvFile` | – | Run this wave and skip the picker |
+| `-CsvFile` | - | Run this wave and skip the picker |
 | `-NonInteractive` | off | Never prompt; run the only available wave or fail |
 | `-TakeOver` | off | Take a wave another engineer's run still claims. Be sure their run is really gone |
 | `-ArchiveRoot` | script folder | Where `Running/` and `Phase1..3/` live |
@@ -193,13 +193,13 @@ stopped (connection failure, bad wave, blocked by a limit).
 
 ## What is checked before a VM is touched
 
-A VM is only migrated once all of this resolves — otherwise it is reported `Failed`, the
+A VM is only migrated once all of this resolves - otherwise it is reported `Failed`, the
 wave goes back to `IN`, and the run continues with the next VM:
 
 * the VM exists and its name is unambiguous
 * no pending vCenter question on the VM
 * the destination cluster has a connected host (or the named host is connected)
-* **phase 1**: every datastore the VM uses is mounted on the destination host — storage
+* **phase 1**: every datastore the VM uses is mounted on the destination host - storage
   does not move in phase 1, so a host that cannot see the disks would fail the vMotion
 * **phase 2**: the datastore exists and has room for the VM plus the reserve
 * **phase 3**: the VM's datastore exists on the new vCenter under the same name, which is
@@ -211,7 +211,7 @@ needed is not done: a VM already in the target cluster keeps the host DRS gave i
 that only needs its port groups changed is reconnected with `Set-NetworkAdapter` rather
 than sent through a pointless relocate.
 
-VM folder placement is not settable — VMs land in the default folder on the new vCenter.
+VM folder placement is not settable - VMs land in the default folder on the new vCenter.
 
 ## Logging
 
@@ -232,7 +232,7 @@ Invoke-Pester -Path .\Tests
 `Tests/BulkVMotion.Tests.ps1` covers VLAN parsing, port group matching and lists, the phase
 state machine, CSV write-back, the cost model, wave state and credentials.
 `Tests/Invoke-BulkVMotion.Tests.ps1` runs the real script end to end against the PowerCLI
-test doubles in `Tests/Fakes` — multi-NIC VMs, per-VM switches, the Running lifecycle
+test doubles in `Tests/Fakes` - multi-NIC VMs, per-VM switches, the Running lifecycle
 including a crashed run, concurrency ceilings, and one wave carried through all three
 phases. No vCenter is needed and neither suite touches a live environment.
 
