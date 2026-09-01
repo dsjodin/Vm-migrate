@@ -43,12 +43,15 @@ BeforeAll {
     }
 
     function Invoke-Runner {
-        param([pscustomobject]$Paths, [string[]]$ExtraArguments = @())
+        param([pscustomobject]$Paths, [string[]]$ExtraArguments = @(), [switch]$OmitTargetVIServer)
+
+        # Leaving out -TargetVIServer is how a single vCenter run is started.
+        $targetServerArguments = if ($OmitTargetVIServer) { @() } else { @('-TargetVIServer', 'vc-new.corp.local') }
 
         $arguments = @(
             '-NoLogo', '-NoProfile', '-File', $script:ScriptPath
             '-SourceVIServer', 'vc-old.corp.local'
-            '-TargetVIServer', 'vc-new.corp.local'
+        ) + $targetServerArguments + @(
             '-TargetVDSwitch', 'VDS-NEW'
             '-DefaultTargetCluster', 'CL-NEW-01'
             '-DefaultTargetDatastore', 'DS-NEW-01'
@@ -268,5 +271,96 @@ Describe 'Invoke-BulkVMotion end to end' {
 
         (Get-MovedFiles -Paths $script:Paths).Count | Should -Be 1
         (Get-InFiles -Paths $script:Paths).Count    | Should -Be 0
+    }
+}
+
+Describe 'Invoke-BulkVMotion within a single vCenter' {
+
+    AfterEach {
+        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
+            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'migrates between two clusters in the same vCenter when no target vCenter is given' {
+        $script:Paths = New-TestRun -CsvContent @('VMName,TargetCluster,TargetDatastore', 'vm-app-01,CL-NEW-01,DS-NEW-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -OmitTargetVIServer
+
+        $run.ExitCode | Should -Be 0
+        (Get-MoveCalls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-app-01 .*portgroups=PG-NEW-Prod-100'
+        (Get-MovedFiles -Paths $script:Paths).Count | Should -Be 1
+    }
+
+    It 'reports a VM that an earlier run already migrated and still archives the CSV' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,TargetCluster,TargetDatastore'
+            'vm-inplace-01,CL-NEW-01,DS-NEW-01'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -OmitTargetVIServer
+
+        $run.ExitCode | Should -Be 0
+        # Nothing was touched.
+        (Get-MoveCalls -Paths $script:Paths).Count | Should -Be 0
+
+        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Status | Should -Be 'AlreadyDone'
+
+        # A file whose VMs are all done is a finished file.
+        (Get-MovedFiles -Paths $script:Paths).Count | Should -Be 1
+        (Get-InFiles -Paths $script:Paths).Count    | Should -Be 0
+    }
+
+    It 'lets a re-run of a partially failed CSV complete the remaining VMs' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,TargetCluster,TargetDatastore'
+            'vm-inplace-01,CL-NEW-01,DS-NEW-01'
+            'vm-app-01,CL-NEW-01,DS-NEW-01'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -OmitTargetVIServer
+
+        $run.ExitCode | Should -Be 0
+        # Only the outstanding VM is migrated.
+        (Get-MoveCalls -Paths $script:Paths).Count | Should -Be 1
+        (Get-MoveCalls -Paths $script:Paths) -join '' | Should -Match 'vm-app-01'
+
+        $results = Get-ResultCsv -Paths $script:Paths
+        ($results | Where-Object { $_.VMName -eq 'vm-inplace-01' }).Status | Should -Be 'AlreadyDone'
+        ($results | Where-Object { $_.VMName -eq 'vm-app-01' }).Status     | Should -Be 'Success'
+        (Get-MovedFiles -Paths $script:Paths).Count | Should -Be 1
+    }
+
+    It 'reconnects the adapters without a vMotion when only the port group differs' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,TargetCluster,TargetDatastore'
+            'vm-netonly-01,CL-NEW-01,DS-NEW-01'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -OmitTargetVIServer
+
+        $run.ExitCode | Should -Be 0
+
+        $calls = Get-MoveCalls -Paths $script:Paths
+        ($calls -join "`n") | Should -Match 'SETNIC vm-netonly-01 Network adapter 1 -> PG-NEW-Prod-100'
+        ($calls -join "`n") | Should -Not -Match '^MOVE '
+
+        $result = Get-ResultCsv -Paths $script:Paths | Select-Object -First 1
+        $result.Status  | Should -Be 'Success'
+        $result.Message | Should -Match 'reconnected'
+        (Get-MovedFiles -Paths $script:Paths).Count | Should -Be 1
+    }
+
+    It 'does not move a VM that is already in the target cluster to another host' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,TargetCluster,TargetDatastore'
+            'vm-netonly-01,CL-NEW-01,DS-NEW-01'
+        )
+
+        Invoke-Runner -Paths $script:Paths -OmitTargetVIServer | Out-Null
+
+        # esx-new-02 has the most free memory, so a naive host pick would land there.
+        $result = Get-ResultCsv -Paths $script:Paths | Select-Object -First 1
+        $result.TargetHost | Should -Be 'esx-new-01.corp.local'
     }
 }

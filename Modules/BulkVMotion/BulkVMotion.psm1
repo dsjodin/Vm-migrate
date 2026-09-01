@@ -508,6 +508,33 @@ function Import-PortGroupExceptionMap {
 
 #region vSphere inventory helpers -----------------------------------------------
 
+function Test-VMOnTargetDatastore {
+    <#
+    .SYNOPSIS
+        Tells whether every disk of the VM already lives on the target datastore.
+    .DESCRIPTION
+        When the target is a datastore cluster, any member datastore counts. Used to
+        decide whether a storage move is needed at all - within one vCenter two
+        clusters often share storage, so the move is frequently compute + network only.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$VM,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)]$Server
+    )
+
+    $current = @(Get-Datastore -VM $VM -Server $Server -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    if ($current.Count -eq 0) { return $false }
+
+    # For a datastore cluster this returns its members; for a plain datastore it
+    # returns nothing and the single name is used.
+    $accepted = @(Get-Datastore -Location $Target -Server $Server -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    if ($accepted.Count -eq 0) { $accepted = @($Target.Name) }
+
+    return (@($current | Where-Object { $_ -notin $accepted }).Count -eq 0)
+}
+
 function Resolve-SourceVM {
     <#
     .SYNOPSIS
@@ -702,10 +729,11 @@ function Get-VMNetworkMigrationPlan {
     $resolved   = @()
     $details    = @()
     $errors     = @()
+    $mappings   = @()
 
     if ($adapters.Count -eq 0) {
         Write-BulkVMotionLog -Level Warning -VMName $VM.Name -Message 'VM has no network adapters - it will be migrated without a network change.'
-        return [pscustomobject]@{ Success = $true; Adapters = @(); PortGroups = @(); Details = @(); Errors = @() }
+        return [pscustomobject]@{ Success = $true; Adapters = @(); PortGroups = @(); Details = @(); Errors = @(); Mappings = @(); NetworkChangeNeeded = $false }
     }
 
     if ($Override -and $adapters.Count -gt 1) {
@@ -737,15 +765,27 @@ function Get-VMNetworkMigrationPlan {
         }
 
         $resolved += $match.PortGroup
-        $details  += '{0}: {1} ({2}) -> {3} [{4}]' -f $adapter.Name, $sourcePg.Name, $vlanInfo.Description, $match.PortGroup.Name, $match.MatchedBy
+        $alreadyThere = ($sourcePg.Name -eq $match.PortGroup.Name)
+        $suffix = if ($alreadyThere) { ' (already connected)' } else { '' }
+        $details  += '{0}: {1} ({2}) -> {3} [{4}]{5}' -f $adapter.Name, $sourcePg.Name, $vlanInfo.Description, $match.PortGroup.Name, $match.MatchedBy, $suffix
+        $mappings += [pscustomobject]@{
+            Adapter         = $adapter
+            AdapterName     = $adapter.Name
+            SourceName      = $sourcePg.Name
+            TargetPortGroup = $match.PortGroup
+            TargetName      = $match.PortGroup.Name
+            AlreadyConnected = $alreadyThere
+        }
     }
 
     return [pscustomobject]@{
-        Success    = ($errors.Count -eq 0)
-        Adapters   = $adapters
-        PortGroups = $resolved
-        Details    = $details
-        Errors     = $errors
+        Success             = ($errors.Count -eq 0)
+        Adapters            = $adapters
+        PortGroups          = $resolved
+        Details             = $details
+        Errors              = $errors
+        Mappings            = $mappings
+        NetworkChangeNeeded = @($mappings | Where-Object { -not $_.AlreadyConnected }).Count -gt 0
     }
 }
 
@@ -793,6 +833,11 @@ function New-VMMigrationPlan {
         Adapters       = @()
         PortGroups     = @()
         NetworkDetails = @()
+        ChangesCompute = $false
+        ChangesStorage = $false
+        ChangesNetwork = $false
+        NetworkOnly    = $false
+        AlreadyInPlace = $false
         Ready          = $false
         Errors         = @()
     }
@@ -818,12 +863,19 @@ function New-VMMigrationPlan {
         $plan.Errors += 'The VM has a pending question in vCenter and cannot be migrated until it is answered.'
     }
 
-    # Destination host.
+    # Destination host. Within one vCenter a VM that already sits in the target cluster
+    # stays on the host it is on - re-running a CSV must not shuffle VMs between hosts
+    # that DRS has already placed.
+    $inTargetCluster = (-not $CrossVCenter) -and $plan.TargetCluster -and ($plan.SourceCluster -eq $plan.TargetCluster)
+
     try {
-        $plan.TargetHost = Select-TargetVMHost -Server $TargetServer -ClusterName $plan.TargetCluster -HostName $Row.TargetHost
-        if (-not $CrossVCenter -and $plan.TargetHost.Name -eq $plan.SourceHost) {
-            $plan.Errors += "The VM already runs on the selected destination host '$($plan.SourceHost)'."
+        if ($inTargetCluster -and -not $Row.TargetHost) {
+            $plan.TargetHost = $vm.VMHost
         }
+        else {
+            $plan.TargetHost = Select-TargetVMHost -Server $TargetServer -ClusterName $plan.TargetCluster -HostName $Row.TargetHost
+        }
+        $plan.ChangesCompute = $CrossVCenter -or ($plan.TargetHost.Name -ne $plan.SourceHost)
     }
     catch {
         $plan.Errors += $_.Exception.Message
@@ -832,8 +884,18 @@ function New-VMMigrationPlan {
     # Destination storage.
     if ($plan.DatastoreName) {
         try {
-            $requiredGB = [math]::Round([double]$vm.UsedSpaceGB, 2)
-            $plan.Datastore = Resolve-TargetDatastore -Name $plan.DatastoreName -Server $TargetServer -RequiredGB $requiredGB -ReserveGB $DatastoreReserveGB
+            # Only demand free space when the VM actually has to move there.
+            $candidate = Resolve-TargetDatastore -Name $plan.DatastoreName -Server $TargetServer
+            if (Test-VMOnTargetDatastore -VM $vm -Target $candidate -Server $TargetServer) {
+                $plan.Datastore      = $null
+                $plan.ChangesStorage = $false
+                Write-BulkVMotionLog -Level Debug -VMName $vm.Name -Message "Already on '$($plan.DatastoreName)' - no storage move needed."
+            }
+            else {
+                $requiredGB = [math]::Round([double]$vm.UsedSpaceGB, 2)
+                $plan.Datastore = Resolve-TargetDatastore -Name $plan.DatastoreName -Server $TargetServer -RequiredGB $requiredGB -ReserveGB $DatastoreReserveGB
+                $plan.ChangesStorage = $true
+            }
         }
         catch {
             $plan.Errors += $_.Exception.Message
@@ -860,6 +922,7 @@ function New-VMMigrationPlan {
         $plan.Adapters       = $network.Adapters
         $plan.PortGroups     = $network.PortGroups
         $plan.NetworkDetails = $network.Details
+        $plan.ChangesNetwork = $network.NetworkChangeNeeded
         if (-not $network.Success) { $plan.Errors += $network.Errors }
     }
     catch {
@@ -867,6 +930,17 @@ function New-VMMigrationPlan {
     }
 
     $plan.Ready = ($plan.Errors.Count -eq 0)
+
+    if ($plan.Ready) {
+        # Nothing left to do means the VM was migrated by an earlier run: a CSV that
+        # stayed in IN after a partial failure has to be re-runnable.
+        $plan.AlreadyInPlace = -not ($plan.ChangesCompute -or $plan.ChangesStorage -or $plan.ChangesNetwork)
+
+        # Same cluster, same storage, only the port groups differ - reconnecting the
+        # adapters is the right operation, Move-VM would refuse a no-op relocate.
+        $plan.NetworkOnly = $plan.ChangesNetwork -and -not $plan.ChangesCompute -and -not $plan.ChangesStorage
+    }
+
     return $plan
 }
 
@@ -888,6 +962,13 @@ function Write-MigrationPlanReport {
     foreach ($detail in $Plan.NetworkDetails) {
         Write-BulkVMotionLog -VMName $vmName -Message ('Network     : {0}' -f $detail)
     }
+
+    $changes = @()
+    if ($Plan.ChangesCompute) { $changes += 'compute' }
+    if ($Plan.ChangesStorage) { $changes += 'storage' }
+    if ($Plan.ChangesNetwork) { $changes += 'network' }
+    $summary = if ($changes.Count -gt 0) { $changes -join ' + ' } else { 'nothing - the VM is already where the CSV wants it' }
+    Write-BulkVMotionLog -VMName $vmName -Message ('Will change : {0}' -f $summary)
     foreach ($problem in $Plan.Errors) {
         Write-BulkVMotionLog -Level Error -VMName $vmName -Message $problem
     }
@@ -906,6 +987,17 @@ function Start-VMMigrationTask {
         [ValidateSet('Thin', 'Thick', 'EagerZeroedThick', 'AsDefined')][string]$DiskStorageFormat = 'AsDefined'
     )
 
+    # The VM is already on the right host and storage - only the adapters have to be
+    # reconnected. Move-VM would be asked to relocate a VM that is not going anywhere,
+    # so reconfigure the adapters instead. This is quick, so it runs synchronously and
+    # the caller gets $null instead of a task.
+    if ($Plan.NetworkOnly) {
+        for ($i = 0; $i -lt $Plan.Adapters.Count; $i++) {
+            Set-NetworkAdapter -NetworkAdapter $Plan.Adapters[$i] -Portgroup $Plan.PortGroups[$i] -Confirm:$false -ErrorAction Stop | Out-Null
+        }
+        return $null
+    }
+
     $params = @{
         VM          = $Plan.VM
         Destination = $Plan.TargetHost
@@ -914,7 +1006,7 @@ function Start-VMMigrationTask {
         ErrorAction = 'Stop'
     }
 
-    if ($Plan.Adapters.Count -gt 0) {
+    if ($Plan.Adapters.Count -gt 0 -and $Plan.ChangesNetwork) {
         # Move-VM pairs the two lists positionally, so a mismatch would silently connect
         # an adapter to the wrong network. A ready plan always resolves one port group
         # per adapter, so treat anything else as a bug rather than working around it.
@@ -1014,7 +1106,7 @@ function New-MigrationTracker {
     param(
         [Parameter(Mandatory)]$Plan,
         $Task,
-        [ValidateSet('Running', 'Success', 'Failed', 'TimedOut', 'Skipped')][string]$Status = 'Running',
+        [ValidateSet('Running', 'Success', 'Failed', 'TimedOut', 'Skipped', 'AlreadyDone')][string]$Status = 'Running',
         [string]$Message
     )
 
@@ -1075,6 +1167,7 @@ Export-ModuleMember -Function @(
     'Resolve-SourceVM'
     'Select-TargetVMHost'
     'Resolve-TargetDatastore'
+    'Test-VMOnTargetDatastore'
     'Get-SourcePortGroupCache'
     'Get-NetworkAdapterSourcePortGroup'
     'Get-VMNetworkMigrationPlan'

@@ -7,5 +7,5 @@
     PowerShellVersion = '5.1'
     FunctionsToExport = @('Connect-VIServer', 'Disconnect-VIServer', 'Set-PowerCLIConfiguration',
         'Get-VM', 'Get-NetworkAdapter', 'Get-VirtualPortGroup', 'Get-Cluster', 'Get-VMHost',
-        'Get-Datastore', 'Get-DatastoreCluster', 'Get-Folder', 'Move-VM', 'Get-Task')
+        'Get-Datastore', 'Get-DatastoreCluster', 'Get-Folder', 'Move-VM', 'Get-Task', 'Set-NetworkAdapter')
 }

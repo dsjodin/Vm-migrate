@@ -21,6 +21,7 @@
         'Resolve-SourceVM'
         'Select-TargetVMHost'
         'Resolve-TargetDatastore'
+        'Test-VMOnTargetDatastore'
         'Get-SourcePortGroupCache'
         'Get-NetworkAdapterSourcePortGroup'
         'Get-VMNetworkMigrationPlan'

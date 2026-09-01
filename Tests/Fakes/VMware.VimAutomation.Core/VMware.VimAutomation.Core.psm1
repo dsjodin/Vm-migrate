@@ -25,7 +25,7 @@ $script:Tasks = @{}
 $script:TaskCounter = 0
 
 function script:New-Adapter {
-    param([string]$Name, [string]$NetworkName, [string]$PortgroupKey)
+    param([string]$Name, [string]$NetworkName, [string]$PortgroupKey, [string]$VMName)
 
     $backing = [VirtualEthernetCardDistributedVirtualPortBackingInfo]::new()
     $backing.Port = [pscustomobject]@{ PortgroupKey = $PortgroupKey }
@@ -33,18 +33,30 @@ function script:New-Adapter {
     [pscustomobject]@{
         Name          = $Name
         NetworkName   = $NetworkName
+        Parent        = $VMName
         ExtensionData = [pscustomobject]@{ Backing = $backing }
     }
 }
 
-$script:SourceHost = [pscustomobject]@{ Name = 'esx-old-01.corp.local' }
-
 $script:VMs = @{
-    'vm-app-01'    = @{ Adapters = @((script:New-Adapter -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')); UsedSpaceGB = 40 }
-    'vm-app-02'    = @{ Adapters = @((script:New-Adapter -Name 'Network adapter 1' -NetworkName 'PG-OLD-Test-200' -PortgroupKey 'dvpg-old-200')); UsedSpaceGB = 60 }
-    'vm-dmz-01'    = @{ Adapters = @((script:New-Adapter -Name 'Network adapter 1' -NetworkName 'PG-OLD-DMZ-999'  -PortgroupKey 'dvpg-old-999')); UsedSpaceGB = 20 }
-    'vm-fail-task' = @{ Adapters = @((script:New-Adapter -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')); UsedSpaceGB = 10 }
-    'vm-huge-01'   = @{ Adapters = @((script:New-Adapter -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')); UsedSpaceGB = 9000 }
+    'vm-app-01'     = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 40
+        Adapters = @((script:New-Adapter -VMName 'vm-app-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
+    'vm-app-02'     = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 60
+        Adapters = @((script:New-Adapter -VMName 'vm-app-02' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Test-200' -PortgroupKey 'dvpg-old-200')) }
+    'vm-dmz-01'     = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 20
+        Adapters = @((script:New-Adapter -VMName 'vm-dmz-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-DMZ-999' -PortgroupKey 'dvpg-old-999')) }
+    'vm-fail-task'  = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 10
+        Adapters = @((script:New-Adapter -VMName 'vm-fail-task' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
+    'vm-huge-01'    = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 9000
+        Adapters = @((script:New-Adapter -VMName 'vm-huge-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
+
+    # Already migrated by an earlier run: target cluster, target storage, target port group.
+    'vm-inplace-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-inplace-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+
+    # In the target cluster and on target storage, but still on the old VDS port group.
+    'vm-netonly-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-netonly-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
 }
 
 function script:Write-FakeLog {
@@ -78,7 +90,7 @@ function Get-VM {
         Name          = $Name
         PowerState    = 'PoweredOn'
         UsedSpaceGB   = $script:VMs[$Name].UsedSpaceGB
-        VMHost        = $script:SourceHost
+        VMHost        = [pscustomobject]@{ Name = $script:VMs[$Name].Host }
         ExtensionData = [pscustomobject]@{ Runtime = [pscustomobject]@{ Question = $null } }
     }
 }
@@ -99,7 +111,10 @@ function Get-Cluster {
     [CmdletBinding()]
     param([string]$Name, $VMHost, $Server)
 
-    if ($VMHost) { return [pscustomobject]@{ Name = 'CL-OLD-01' } }
+    if ($VMHost) {
+        $cluster = if ($VMHost.Name -like 'esx-new-*') { 'CL-NEW-01' } else { 'CL-OLD-01' }
+        return [pscustomobject]@{ Name = $cluster }
+    }
     if ($Name -eq 'CL-NEW-01') { return [pscustomobject]@{ Name = 'CL-NEW-01' } }
     return $null
 }
@@ -124,10 +139,23 @@ function Get-DatastoreCluster {
 
 function Get-Datastore {
     [CmdletBinding()]
-    param([string]$Name, $Server)
+    param([string]$Name, $VM, $Location, $Server)
+
+    # Which datastores is this VM on today?
+    if ($VM) { return [pscustomobject]@{ Name = $script:VMs[$VM.Name].Datastore } }
+
+    # Members of a datastore cluster - there are none in this inventory.
+    if ($Location) { return @() }
 
     if ($Name -eq 'DS-NEW-01') { return [pscustomobject]@{ Name = 'DS-NEW-01'; FreeSpaceGB = 5000 } }
     return @()
+}
+
+function Set-NetworkAdapter {
+    [CmdletBinding()]
+    param($NetworkAdapter, $Portgroup, [switch]$Confirm)
+
+    script:Write-FakeLog -Line ('SETNIC {0} {1} -> {2}' -f $NetworkAdapter.Parent, $NetworkAdapter.Name, $Portgroup.Name)
 }
 
 function Get-Folder {
@@ -187,4 +215,4 @@ function Get-Task {
 
 Export-ModuleMember -Function 'Connect-VIServer', 'Disconnect-VIServer', 'Set-PowerCLIConfiguration',
 'Get-VM', 'Get-NetworkAdapter', 'Get-VirtualPortGroup', 'Get-Cluster', 'Get-VMHost',
-'Get-Datastore', 'Get-DatastoreCluster', 'Get-Folder', 'Move-VM', 'Get-Task'
+'Get-Datastore', 'Get-DatastoreCluster', 'Get-Folder', 'Move-VM', 'Get-Task', 'Set-NetworkAdapter'

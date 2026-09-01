@@ -198,6 +198,7 @@ $summary = [ordered]@{
     'CSV files moved'     = 0
     'VMs total'           = 0
     'VMs migrated'        = 0
+    'VMs already in place' = 0
     'VMs failed'          = 0
     'VMs skipped'         = 0
 }
@@ -332,6 +333,12 @@ try {
                     continue
                 }
 
+                if ($plan.AlreadyInPlace) {
+                    $completed += New-MigrationTracker -Plan $plan -Status 'AlreadyDone' -Message 'Already in the target cluster, on the target storage and on the target port group(s) - nothing to do.'
+                    Write-BulkVMotionLog -Level Success -VMName $row.VMName -Message 'Already migrated by an earlier run - nothing to do.'
+                    continue
+                }
+
                 if ($ValidateOnly) {
                     $completed += New-MigrationTracker -Plan $plan -Status 'Skipped' -Message 'Validation only - the VM was not migrated.'
                     Write-BulkVMotionLog -Level Success -VMName $row.VMName -Message 'Plan is valid.'
@@ -345,8 +352,18 @@ try {
 
                 try {
                     $task = Start-VMMigrationTask -Plan $plan -VMotionPriority $VMotionPriority -DiskStorageFormat $DiskStorageFormat
-                    $running += New-MigrationTracker -Plan $plan -Task $task
-                    Write-BulkVMotionLog -Level Success -VMName $row.VMName -Message "Migration started (task $($task.Id))."
+
+                    if ($null -eq $task) {
+                        # Port groups only - Start-VMMigrationTask did it synchronously.
+                        $tracker = New-MigrationTracker -Plan $plan -Status 'Success' -Message 'Network adapter(s) reconnected to the target port group(s); no vMotion was needed.'
+                        $tracker.End = Get-Date
+                        $completed += $tracker
+                        Write-BulkVMotionLog -Level Success -VMName $row.VMName -Message 'Network adapter(s) reconnected to the target port group(s) - no vMotion was needed.'
+                    }
+                    else {
+                        $running += New-MigrationTracker -Plan $plan -Task $task
+                        Write-BulkVMotionLog -Level Success -VMName $row.VMName -Message "Migration started (task $($task.Id))."
+                    }
                 }
                 catch {
                     $completed += New-MigrationTracker -Plan $plan -Status 'Failed' -Message $_.Exception.Message
@@ -385,13 +402,15 @@ try {
 
         #region Result of this file ---------------------------------------------
 
-        $succeeded = @($completed | Where-Object { $_.Status -eq 'Success' })
-        $failed    = @($completed | Where-Object { $_.Status -in @('Failed', 'TimedOut') })
-        $skipped   = @($completed | Where-Object { $_.Status -eq 'Skipped' })
+        $succeeded   = @($completed | Where-Object { $_.Status -eq 'Success' })
+        $failed      = @($completed | Where-Object { $_.Status -in @('Failed', 'TimedOut') })
+        $skipped     = @($completed | Where-Object { $_.Status -eq 'Skipped' })
+        $alreadyDone = @($completed | Where-Object { $_.Status -eq 'AlreadyDone' })
 
-        $summary['VMs migrated'] += $succeeded.Count
-        $summary['VMs failed']   += $failed.Count
-        $summary['VMs skipped']  += $skipped.Count
+        $summary['VMs migrated']       += $succeeded.Count
+        $summary['VMs failed']         += $failed.Count
+        $summary['VMs skipped']        += $skipped.Count
+        $summary['VMs already in place'] += $alreadyDone.Count
 
         if ($completed.Count -gt 0) {
             $resultPath = Join-Path $LogFolder ('{0}_result_{1}.csv' -f $file.BaseName, (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -399,7 +418,7 @@ try {
             Write-BulkVMotionLog -Message "Per VM result written to $resultPath"
         }
 
-        Write-BulkVMotionLog -Message ('Result for {0}: {1} migrated, {2} failed, {3} skipped.' -f $file.Name, $succeeded.Count, $failed.Count, $skipped.Count)
+        Write-BulkVMotionLog -Message ('Result for {0}: {1} migrated, {2} already in place, {3} failed, {4} skipped.' -f $file.Name, $succeeded.Count, $alreadyDone.Count, $failed.Count, $skipped.Count)
         foreach ($item in $failed) {
             Write-BulkVMotionLog -Level Error -VMName $item.VMName -Message ('{0}: {1}' -f $item.Status, $item.Message)
         }
@@ -410,7 +429,7 @@ try {
         $shouldMove = switch ($MoveCsvWhen) {
             'Always'     { $true }
             'Never'      { $false }
-            'AllSuccess' { ($failed.Count -eq 0 -and $skipped.Count -eq 0 -and $succeeded.Count -gt 0) }
+            'AllSuccess' { ($failed.Count -eq 0 -and $skipped.Count -eq 0 -and ($succeeded.Count + $alreadyDone.Count) -gt 0) }
         }
 
         if ($ValidateOnly) {

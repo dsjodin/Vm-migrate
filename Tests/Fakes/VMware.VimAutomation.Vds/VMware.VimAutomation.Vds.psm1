@@ -63,8 +63,16 @@ function Get-VDPortgroup {
     [CmdletBinding()]
     param($VDSwitch, $Server, [string]$Name)
 
-    $isSource = $Server -and ([string]$Server.Name) -like 'vc-old*'
-    $result = if ($isSource) { $script:SourcePortGroups } else { $script:TargetPortGroups }
+    # Asking for one switch returns that switch's port groups. Asking without a switch
+    # is the source side cache, which in a single vCenter legitimately sees both the old
+    # and the new VDS - that is exactly why -TargetVDSwitch matters.
+    $result = if ($VDSwitch) {
+        @($script:SourcePortGroups + $script:TargetPortGroups | Where-Object { $_.VDSwitch -eq $VDSwitch.Name })
+    }
+    else {
+        @($script:SourcePortGroups + $script:TargetPortGroups)
+    }
+
     if ($Name) { $result = @($result | Where-Object { $_.Name -eq $Name }) }
     return $result
 }
