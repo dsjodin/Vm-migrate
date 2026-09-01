@@ -589,6 +589,31 @@ Describe 'Waves on a shared mgmt server' {
         (Get-InFiles -Paths $script:Paths).Count      | Should -Be 1
     }
 
+    It 'ignores a target vCenter that came from the config on a single vCenter phase' {
+        # config/settings.json describes the whole project, phase 3 included, and is read
+        # by every run - so a TargetVIServer in it must not break phases 1 and 2.
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+        @{
+            TargetVIServer = 'vc-new.corp.local'
+        } | ConvertTo-Json | Set-Content -LiteralPath $script:Paths.Config
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
+    }
+
+    It 'still refuses a target vCenter named on the command line for phase 1' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+
+        # Naming it on the command line for phase 1 is a mistake worth stopping for.
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1 -ExtraArguments @('-TargetVIServer', 'vc-new.corp.local')
+
+        $run.ExitCode | Should -Be 2
+        $run.Output   | Should -Match 'Only phase 3 crosses vCenters'
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+    }
+
     It 'names the log after the engineer who ran it' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
 

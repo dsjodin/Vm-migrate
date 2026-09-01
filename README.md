@@ -24,10 +24,12 @@ LOGS/     one .log per run + one result CSV per wave per phase
 
 When the next wave is due, move the file from `Phase1` back into `IN` and run phase 2.
 
-## First run: store your credentials
+## Before your first run
 
-Several engineers share the mgmt server, so credentials are per engineer rather than in a
-config file. Run this once per vCenter:
+Two things, once each.
+
+**1. Store your vCenter credentials.** Several engineers share the mgmt server, so
+credentials are per engineer rather than in a config file. Run this once per vCenter:
 
 ```powershell
 .\Save-MigrationCredential.ps1 -VIServer vc.corp.local
@@ -36,31 +38,263 @@ config file. Run this once per vCenter:
 
 The password is encrypted with DPAPI to **your Windows account on that machine**: a
 colleague logged into the same server cannot read it, and the file is useless if copied
-elsewhere. `-Remove` forgets one. Runs then pick the credential up on their own, and
+elsewhere. `-Remove` forgets one. Runs then pick your credential up on their own and
 prompt only if there is nothing stored. `-SourceCredential` / `-TargetCredential` still
 override everything.
 
 > Windows only. On Linux and macOS PowerShell does not encrypt a SecureString, so saving
 > is refused rather than writing your password out in the clear.
 
-## Running a wave
+**2. Put your site's names in the config.** Copy the sample and edit it:
 
 ```powershell
-# Always dry run first: resolves everything, migrates nothing, and writes back the
-# port groups it worked out so you can check them
+Copy-Item .\docs\samples\settings.json .\config\settings.json
+notepad .\config\settings.json
+```
+
+Set `SourceVIServer`, `TargetVIServer`, `DefaultTargetCluster` and `TargetVDSwitch` to your
+real names. `config/settings.json` is gitignored, so your vCenter and cluster names stay
+out of the repository, and every command below works as written without substituting
+anything. Anything you pass on the command line still wins over the config.
+
+## The life of a wave file
+
+A wave is one CSV. It carries its own state, so the folder it sits in tells you how far
+that wave has got.
+
+```mermaid
+flowchart TD
+    A["Engineer authors the wave CSV"] --> IN["IN/<br>waiting for its next phase"]
+    IN -->|"-ValidateOnly"| DRY["Dry run: resolves everything,<br>writes PhaseNPortGroups only"]
+    DRY --> IN
+    IN -->|"engineer picks it<br>run marker written"| RUN["Running/<br>claimed by one engineer"]
+    RUN -->|"a VM failed, or the run died"| IN
+    RUN -->|"every row reached the phase"| WHICH{"which phase<br>just finished"}
+    WHICH -->|"phase 1"| P1["Phase1/"]
+    WHICH -->|"phase 2"| P2["Phase2/"]
+    WHICH -->|"phase 3"| P3["Phase3/<br>fully migrated"]
+    P1 -->|"you move it back<br>when the storage wave is due"| IN
+    P2 -->|"you move it back<br>when the cross vCenter wave is due"| IN
+```
+
+The two arrows out of `Phase1/` and `Phase2/` are the only manual steps: nothing moves a
+wave on to its next phase by itself.
+
+What gets written, and where:
+
+| When | What is written | Where |
+| --- | --- | --- |
+| Wave picked | engineer, machine, process id, start time, phase | `Running/<wave>.run.json` |
+| Throughout the run | every decision and every migration | `LOGS/bulk-vmotion_<engineer>_<timestamp>.log` |
+| A VM completes the phase | `PhaseCompleted`, `CompletedAt`, `CompletedBy`, `ResultVIServer`, `ResultCluster`, `ResultHost`, `ResultDatastore`, and the phase's `PhaseNPortGroups` | the wave CSV, on that VM's row |
+| Dry run only | `PhaseNPortGroups` | the wave CSV, nothing else touched |
+| Run ends | one row per VM: status, duration, port groups, failure message | `LOGS/<wave>_phase<N>_<engineer>_result_<timestamp>.csv` |
+| Wave released | the run marker is deleted | `Running/` |
+
+The dry run row is the one to remember: it is the only write that happens without the wave
+being claimed, and what it writes is what you review before committing to the migration.
+
+## Phase 1: cluster and VDS
+
+vMotion to the new cluster and remap every NIC onto the new VDS by VLAN. Storage does not
+move, so the new cluster must already see the VMs' datastores.
+
+**1. Author the wave.** One row per VM, saved into `IN/` with a name that identifies it,
+for example `wave-app-01.csv`:
+
+```csv
+VMName,SourceCluster,Phase1Cluster,Phase1VDS,Phase2Datastore,Phase3Cluster,Phase3VDS
+vm-app-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01
+vm-web-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01
+```
+
+Fill in all three phases now if you know them; each phase reads only its own columns.
+Anything left blank falls back to the config. Do not add the port group columns - that is
+the script's job.
+
+**2. Dry run.** Always.
+
+```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 1 -SourceVIServer vc.corp.local -ValidateOnly
+```
 
-# Then for real
+Nothing is migrated, the wave stays in `IN/`, and no phase is recorded. What it does do is
+work out the port group for every NIC and write it into the file.
+
+**3. Check what it resolved.** Open the CSV. A `Phase1PortGroups` column has appeared,
+with one entry per adapter:
+
+```csv
+VMName,...,Phase1PortGroups,PhaseCompleted
+vm-app-01,...,"Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300",0
+vm-web-01,...,"Network adapter 1=PG-NEW-Test-200",0
+```
+
+Check every VLAN landed where you expect. If one did not, edit the cell - the real run
+uses what is in it. `PhaseCompleted` is still `0`, because nothing has happened yet.
+
+The log says the same thing, with the VLAN it matched on:
+
+```
+[vm-app-01] Switch      : VDS-NEW-01
+[vm-app-01] Network     : Network adapter 1: PG-OLD-Prod-100 (VLAN 100) -> PG-NEW-Prod-100 [VlanId]
+[vm-app-01] Network     : Network adapter 2: PG-OLD-Bkp-300 (VLAN 300) -> PG-NEW-Bkp-300 [VlanId]
+[vm-app-01] Will change : compute + network
+```
+
+**4. Run it.** Same command without `-ValidateOnly`:
+
+```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 1 -SourceVIServer vc.corp.local
+```
 
-# Phase 2, weeks later
+```
+[INFO   ] Wave                     : wave-app-01.csv (2 VM(s))
+[INFO   ] Phase                    : 1
+[INFO   ] [vm-app-01] Network     : Network adapter 1: PG-OLD-Prod-100 (VLAN 100) -> PG-NEW-Prod-100 [Override]
+[INFO   ] [vm-app-01] Network     : Network adapter 2: PG-OLD-Bkp-300 (VLAN 300) -> PG-NEW-Bkp-300 [Override]
+[INFO   ] [vm-app-01] Will change : compute + network
+[SUCCESS] [vm-app-01] Migration started (task Task-task-1).
+[SUCCESS] [vm-app-01] Migration completed in 3.4 minutes.
+[INFO   ] Result for wave-app-01.csv phase 1: 2 migrated, 0 already done, 0 failed, 0 skipped.
+[INFO   ] Recorded phase 1 for 2 VM(s) in wave-app-01.csv.
+[SUCCESS] Wave file is now at ...\Phase1\wave-app-01.csv
+```
+
+`[Override]` rather than `[VlanId]` is expected here: it is using the port groups you
+approved in step 3.
+
+**5. Afterwards.** The file is in `Phase1/` with the outcome recorded per VM:
+
+```csv
+VMName,...,Phase1PortGroups,PhaseCompleted,CompletedAt,CompletedBy,ResultVIServer,ResultCluster,ResultHost,ResultDatastore
+vm-app-01,...,"Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300",1,2026-09-01 21:14:02,dsjodin,vc.corp.local,CL-NEW-01,esx-new-03.corp.local,
+```
+
+`ResultDatastore` is empty on purpose: phase 1 does not move storage. Leave the file in
+`Phase1/` until the storage wave is due.
+
+## Phase 2: storage
+
+Storage vMotion onto the new datastore, thin provisioned. The VMs stay on their hosts and
+their networking is not touched. Two per host at a time, eight per datastore.
+
+**1. Bring the wave back.** Move it out of `Phase1/` into `IN/`:
+
+```powershell
+Move-Item .\Phase1\wave-app-01.csv .\IN\
+```
+
+The only column phase 2 reads is `Phase2Datastore`. If you left it blank, fill it in now,
+or set `DefaultTargetDatastore` in the config.
+
+**2. Dry run.**
+
+```powershell
+.\Invoke-BulkVMotion.ps1 -Phase 2 -SourceVIServer vc.corp.local -ValidateOnly
+```
+
+There are no port groups to resolve in phase 2, so this is a validation only: it checks
+each VM is where phase 1 left it, the datastore exists and has room for the VM plus the
+reserve. Nothing is written to the CSV.
+
+**3. Check what it resolved.**
+
+```
+[INFO   ] Phase means              : Storage vMotion only, host and networking untouched
+[INFO   ] [vm-app-01] Datastore   : DSC-NEW-PROD
+[INFO   ] [vm-app-01] Will change : storage
+```
+
+`Will change : storage` is what you want. Phase 2 never moves a VM between hosts, so
+compute can never appear here. If a VM instead reports `Nothing to do for phase 2` it is
+already on that datastore and will be skipped, which is what you want on a re-run and
+worth a second look if it is the first.
+
+**4. Run it.**
+
+```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 2 -SourceVIServer vc.corp.local
+```
 
-# Phase 3: on to the new vCenter, same storage
+```
+[SUCCESS] [vm-app-01] Migration started (task Task-task-1).
+[SUCCESS] [vm-app-01] Migration completed in 22.7 minutes.
+[INFO   ] Result for wave-app-01.csv phase 2: 2 migrated, 0 already done, 0 failed, 0 skipped.
+[SUCCESS] Wave file is now at ...\Phase2\wave-app-01.csv
+```
+
+A wave larger than two VMs per host will not start them all at once - that is the cost
+model doing its job. Use `-LogLevel Debug` if you want to watch it queue.
+
+**5. Afterwards.** The file is in `Phase2/`, `PhaseCompleted` is `2`, and `ResultDatastore`
+now names the datastore each VM landed on.
+
+## Phase 3: cross vCenter
+
+Cross vCenter vMotion to the new vCenter and cluster. The datastore is the same shared
+volume, so no data moves - but a VDS cannot span vCenters, so the port groups are remapped
+by VLAN a second time.
+
+**1. Bring the wave back.**
+
+```powershell
+Move-Item .\Phase2\wave-app-01.csv .\IN\
+```
+
+Phase 3 reads `Phase3Cluster` and `Phase3VDS`.
+
+**2. Dry run.** This one needs both vCenters:
+
+```powershell
+.\Invoke-BulkVMotion.ps1 -Phase 3 -SourceVIServer vc.corp.local -TargetVIServer vc-new.corp.local -ValidateOnly
+```
+
+As in phase 1, it writes the port groups it resolved - into `Phase3PortGroups` this time,
+leaving the phase 1 column alone as the record of that wave.
+
+**3. Check what it resolved.**
+
+```
+[INFO   ] Phase means              : cross vCenter vMotion, same shared datastore, port groups remapped
+[INFO   ] Target vCenter           : vc-new.corp.local
+[INFO   ] [vm-app-01] Datastore   : DSC-NEW-PROD
+[INFO   ] [vm-app-01] Switch      : VDS-VC2-01
+[INFO   ] [vm-app-01] Network     : Network adapter 1: PG-NEW-Prod-100 (VLAN 100) -> PG-VC2-Prod-100 [VlanId]
+[INFO   ] [vm-app-01] Network     : Network adapter 2: PG-NEW-Bkp-300 (VLAN 300) -> PG-VC2-Bkp-300 [VlanId]
+[INFO   ] [vm-app-01] Will change : compute + network
+```
+
+`Will change : compute + network` with no storage is the point of phase 3: the disks stay
+on the volume they are on. That is not something to eyeball, it is enforced - if the VM's
+datastore does not exist on the new vCenter under the same name, the VM is failed rather
+than copied:
+
+```
+[ERROR  ] [vm-app-01] Datastore 'DSC-NEW-PROD' was not found on vc-new.corp.local. Phase 3
+          expects the same shared storage to be presented to both vCenters.
+```
+
+Seeing that means the storage is not genuinely presented to both sides. Stop and fix the
+presentation; do not work around it in the CSV.
+
+**4. Run it.**
+
+```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 3 -SourceVIServer vc.corp.local -TargetVIServer vc-new.corp.local
 ```
 
-You are shown the waves due for that phase and pick one:
+**5. Afterwards.** The file is in `Phase3/` and the wave is done. Both port group columns
+are kept, so the file is the full record of where every NIC has been:
+
+```csv
+VMName,...,Phase1PortGroups,PhaseCompleted,...,ResultVIServer,ResultCluster,ResultHost,ResultDatastore,Phase3PortGroups
+vm-app-01,...,"Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300",3,...,vc-new.corp.local,CL-FINAL-01,esx-vc2-01.corp.local,DSC-NEW-PROD,"Network adapter 1=PG-VC2-Prod-100; Network adapter 2=PG-VC2-Bkp-300"
+```
+
+## Picking a wave
+
+Every command above shows you the waves due for that phase, and you pick one:
 
 ```
 Waves available for phase 1
@@ -73,14 +307,83 @@ Waves available for phase 1
 Which wave? (number, or Q to quit):
 ```
 
-The wave you pick moves into `Running/` with a marker naming you, your machine and the
-process, so nobody else can start it. When the run ends it goes to `Phase{N}` (all done)
-or back to `IN` (something outstanding) - including if the run crashes, because the
-release happens in the script's `finally`. A wave left behind by a run that really died
-is offered back as **Interrupted**; resuming it skips the VMs that got through.
+Only numbered lines can be picked. The wave you choose moves into `Running/` with a marker
+naming you, your machine and the process, so nobody else can start it. When the run ends it
+goes to `Phase{N}` (all done) or back to `IN` (something outstanding) - including if the run
+crashes, because the release happens in the script's `finally`.
 
-`-CsvFile` names a wave directly and skips the picker. `-NonInteractive` never prompts:
-it runs the only available wave, or fails if there is more than one.
+`-CsvFile .\IN\wave-app-01.csv` names a wave directly and skips the picker.
+`-NonInteractive` never prompts: it runs the only available wave, or fails if there is more
+than one. Both are for scripted runs.
+
+## When a run does not go cleanly
+
+**A VLAN matches two port groups on the target VDS.** The VM is failed rather than guessed
+at:
+
+```
+[ERROR  ] [vm-app-01] VLAN 100 matches several target port groups (PG-A-100, PG-B-100).
+          Set the port group for this adapter in the PhaseNPortGroups column, or add an
+          entry to the port group exception map.
+```
+
+Fix: put the port group you want in that VM's `Phase1PortGroups` / `Phase3PortGroups` cell
+and run the phase again. If the same pair of port groups affects every wave, add a row to
+`config/portgroup-exceptions.csv` instead and it is handled everywhere.
+
+**No port group carries the VLAN at all.**
+
+```
+[ERROR  ] [vm-dmz-01] No target port group carries VLAN 999 (source port group 'PG-OLD-DMZ-999').
+```
+
+Fix: the VLAN is missing from the new VDS. Create it, or name an existing port group in the
+CSV cell.
+
+**Phase 1: the destination cannot see the VM's storage.**
+
+```
+[ERROR  ] [vm-nosan-01] Datastore 'DS-ISOLATED' is not mounted on the destination host
+          'esx-new-02.corp.local'. Phase 1 does not move storage, so the VM cannot run there.
+```
+
+Fix: present the datastore to the new cluster, or take this VM out of the phase 1 wave and
+move it another way. Phase 1 deliberately never moves disks.
+
+**The wave came back to IN with some VMs done.** This is normal, not a failure of the run:
+
+```
+[INFO   ] Result for wave-app-01.csv phase 1: 1 migrated, 0 already done, 2 failed, 0 skipped.
+[WARNING] 'wave-app-01.csv' goes back to IN (2 failed, 0 skipped). Correct the failing rows
+          and run phase 1 again - the VMs that are done will be skipped.
+```
+
+A wave only moves on once every row has reached the phase. The rows that succeeded already
+carry `PhaseCompleted,1`:
+
+```csv
+vm-app-01,...,1,2026-09-01 15:26:26,dsjodin,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,,"Network adapter 1=PG-NEW-Prod-100"
+vm-dmz-01,...,0,,,,,,,
+```
+
+Fix: correct the failing rows and run the same phase again. The finished VMs are reported
+`AlreadyDone` and skipped without being touched. Do not delete them from the file.
+
+**A wave is stuck in Running after a lost RDP session.** It appears in the picker as
+`Interrupted - CORP\bob started phase 1 at 09:14, then the process is gone`, and is
+selectable. Picking it resumes the wave; VMs that got through are skipped. A wave claimed
+from a *different* machine cannot be checked from here, so it shows as `Busy`; use
+`-TakeOver` only when you know that run is really gone.
+
+**A VM sits there not starting.** It is waiting for capacity. Run with `-LogLevel Debug` and
+the reason is logged:
+
+```
+[DEBUG  ] [vm-app-03] Waiting for capacity: host 'esx-new-01.corp.local' is at 8 of 8 migration cost.
+```
+
+That is the cost model, not a fault - it clears as running migrations finish. See
+[Concurrency](#concurrency).
 
 ## The CSV
 
@@ -161,13 +464,6 @@ turns it off.
 > only - there is no higher tier, so 10GigE, 25GigE and 100GigE all cap at 8, and the host
 > limit of 8 binds first anyway. Leave `-VMotionNetworkLimit` at 8 unless your vMotion
 > network is 1GigE, in which case set it to 4.
-
-## Partial waves
-
-A wave only moves to `PhaseN` once **every** row has reached phase N. If 8 of 10 VMs
-succeed, the file goes back to `IN` with those 8 rows marked done. Fix the two failing rows
-and run the same phase again: the 8 are skipped as `AlreadyDone` and only the stragglers
-are migrated. Nothing has to be edited out by hand.
 
 ## Parameters worth knowing
 

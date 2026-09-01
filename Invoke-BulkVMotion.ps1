@@ -156,6 +156,11 @@ if (-not $ConfigFile) {
     if (Test-Path -LiteralPath $defaultConfig) { $ConfigFile = $defaultConfig }
 }
 
+# A target vCenter named on the command line for a phase that does not cross vCenters is
+# a mistake worth stopping for. The same value in the config is not: the config describes
+# the whole project, phase 3 included, and is read by every run.
+$targetVIServerFromCommandLine = $PSBoundParameters.ContainsKey('TargetVIServer')
+
 if ($ConfigFile) {
     if (-not (Test-Path -LiteralPath $ConfigFile)) { throw "Configuration file not found: $ConfigFile" }
     $config = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
@@ -282,7 +287,11 @@ try {
         Write-BulkVMotionLog -Message ('Target vCenter           : {0}' -f $TargetVIServer)
     }
     elseif (-not [string]::IsNullOrWhiteSpace($TargetVIServer) -and $TargetVIServer -ne $SourceVIServer) {
-        throw "Phase $runPhase runs inside one vCenter, but -TargetVIServer '$TargetVIServer' was supplied. Only phase 3 crosses vCenters."
+        if ($targetVIServerFromCommandLine) {
+            throw "Phase $runPhase runs inside one vCenter, but -TargetVIServer '$TargetVIServer' was supplied. Only phase 3 crosses vCenters."
+        }
+        Write-BulkVMotionLog -Level Debug -Message "Ignoring the target vCenter from the configuration file: phase $runPhase runs inside $SourceVIServer."
+        $TargetVIServer = ''
     }
 
     #endregion Choose the wave
