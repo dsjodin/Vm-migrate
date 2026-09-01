@@ -49,13 +49,18 @@ $script:TargetPortGroups = @(
     script:New-Pg -Name 'PG-NEW-Prod-100' -Key 'dvpg-new-100' -VlanId 100
     script:New-Pg -Name 'PG-NEW-Test-200' -Key 'dvpg-new-200' -VlanId 200
     script:New-Pg -Name 'VDS-NEW-Uplinks' -Key 'dvpg-new-upl' -VlanId 0 -IsUplink $true
+
+    # The VDS on the second vCenter, used by phase 3. A VDS cannot span vCenters, so
+    # the port groups are remapped by VLAN a second time.
+    script:New-Pg -Name 'PG-VC2-Prod-100' -Key 'dvpg-vc2-100' -VlanId 100 -Switch 'VDS-VC2'
+    script:New-Pg -Name 'PG-VC2-Test-200' -Key 'dvpg-vc2-200' -VlanId 200 -Switch 'VDS-VC2'
 )
 
 function Get-VDSwitch {
     [CmdletBinding()]
     param([string]$Name, $Server)
 
-    if ($Name -eq 'VDS-NEW') { return [pscustomobject]@{ Name = 'VDS-NEW' } }
+    if ($Name -in @('VDS-NEW', 'VDS-VC2', 'VDS-OLD')) { return [pscustomobject]@{ Name = $Name } }
     return $null
 }
 

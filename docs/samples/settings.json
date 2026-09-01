@@ -1,14 +1,10 @@
 {
-  "_comment": "Copy this file to config/settings.json to avoid typing the same arguments on every run. Anything passed on the command line overrides what is set here.",
+  "_comment": "Copy to config/settings.json to avoid retyping the standing arguments. Anything passed on the command line overrides what is set here. The phase specific values are the ones you change between waves.",
 
-  "SourceVIServer": "vc-old.corp.local",
-  "TargetVIServer": "vc-new.corp.local",
+  "SourceVIServer": "vc.corp.local",
 
   "TargetVDSwitch": [ "VDS-NEW-01" ],
-
   "DefaultTargetCluster": "CL-NEW-01",
-  "DefaultTargetDatastore": "DSC-NEW-PROD",
-  "DefaultTargetFolder": "",
 
   "MaxConcurrentMigrations": 2,
   "MigrationTimeoutMinutes": 120,

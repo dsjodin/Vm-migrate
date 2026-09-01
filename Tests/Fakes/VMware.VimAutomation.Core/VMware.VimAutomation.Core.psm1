@@ -1,18 +1,20 @@
 <#
     Test double for the core PowerCLI cmdlets used by BulkVMotion.
 
-    Inventory:
-      source vCenter 'vc-old' : cluster CL-OLD-01, host esx-old-01
-        vm-app-01     NIC on PG-OLD-Prod-100 (VLAN 100)   -> migrates cleanly
-        vm-app-02     NIC on PG-OLD-Test-200 (VLAN 200)   -> migrates cleanly
-        vm-dmz-01     NIC on PG-OLD-DMZ-999  (VLAN 999)   -> no target port group, plan fails
-        vm-fail-task  NIC on PG-OLD-Prod-100              -> the vCenter task fails
-      target vCenter 'vc-new' : cluster CL-NEW-01, hosts esx-new-01/02, datastore DS-NEW-01
+    The inventory models the real three phase journey:
 
-    Every Move-VM call is appended to the file named by $env:BVM_FAKE_LOG so a test can
-    assert which VMs were actually migrated.
+      vc-old  CL-OLD-01   esx-old-01                sees DS-OLD-01
+              CL-NEW-01   esx-new-01, esx-new-02    sees DS-OLD-01 + DS-NEW-01
+              CL-NOSAN    esx-iso-01                sees DS-ISOLATED only
+      vc-new  CL-FINAL-01 esx-vc2-01, esx-vc2-02    sees DS-NEW-01 (the same shared LUN)
+
+    Phase 1 moves a VM from CL-OLD-01 to CL-NEW-01 while it keeps DS-OLD-01, which is
+    why the new cluster has to see that datastore. Phase 2 moves it to DS-NEW-01.
+    Phase 3 moves it to vc-new/CL-FINAL-01 with DS-NEW-01 unchanged.
+
+    Every Move-VM and Set-NetworkAdapter call is appended to $env:BVM_FAKE_LOG so a test
+    can assert what was actually done.
 #>
-
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Test double: the parameters exist so the signatures match the real PowerCLI cmdlets, even when this stub ignores them.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSupportsShouldProcess', '', Justification = 'Test double: -Confirm is declared to match the real PowerCLI cmdlets.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Test double: no state is changed.')]
@@ -38,7 +40,51 @@ function script:New-Adapter {
     }
 }
 
+# Which datastores each host can see.
+$script:HostDatastores = @{
+    'esx-old-01.corp.local' = @('DS-OLD-01')
+    'esx-new-01.corp.local' = @('DS-OLD-01', 'DS-NEW-01')
+    'esx-new-02.corp.local' = @('DS-OLD-01', 'DS-NEW-01')
+    'esx-vc2-01.corp.local' = @('DS-NEW-01')
+    'esx-vc2-02.corp.local' = @('DS-NEW-01')
+    'esx-iso-01.corp.local' = @('DS-ISOLATED')
+}
+
+$script:HostCluster = @{
+    'esx-old-01.corp.local' = 'CL-OLD-01'
+    'esx-new-01.corp.local' = 'CL-NEW-01'
+    'esx-new-02.corp.local' = 'CL-NEW-01'
+    'esx-vc2-01.corp.local' = 'CL-FINAL-01'
+    'esx-vc2-02.corp.local' = 'CL-FINAL-01'
+    'esx-iso-01.corp.local' = 'CL-NOSAN'
+}
+
+$script:Hosts = @(
+    [pscustomobject]@{ Name = 'esx-old-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 400 }
+    [pscustomobject]@{ Name = 'esx-new-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 300 }
+    [pscustomobject]@{ Name = 'esx-new-02.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
+    [pscustomobject]@{ Name = 'esx-vc2-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
+    [pscustomobject]@{ Name = 'esx-vc2-02.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 200 }
+    [pscustomobject]@{ Name = 'esx-iso-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
+)
+
+$script:Datastores = @{
+    'DS-OLD-01'   = 5000
+    'DS-NEW-01'   = 5000
+    'DS-ISOLATED' = 5000
+    'DS-TINY-01'  = 5
+}
+
+# The second vCenter only has the shared volume presented to it. A VM that has not had
+# its phase 2 storage move cannot be found a datastore there, which is exactly the check
+# phase 3 relies on.
+$script:DatastoresByVIServer = @{
+    'vc-old.corp.local' = @('DS-OLD-01', 'DS-NEW-01', 'DS-ISOLATED', 'DS-TINY-01')
+    'vc-new.corp.local' = @('DS-NEW-01')
+}
+
 $script:VMs = @{
+    # Phase 1 candidates: old cluster, old storage, old VDS.
     'vm-app-01'     = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 40
         Adapters = @((script:New-Adapter -VMName 'vm-app-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
     'vm-app-02'     = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 60
@@ -50,14 +96,72 @@ $script:VMs = @{
     'vm-huge-01'    = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 9000
         Adapters = @((script:New-Adapter -VMName 'vm-huge-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
 
-    # Already migrated by an earlier run: target cluster, target storage, target port group.
-    'vm-inplace-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
-        Adapters = @((script:New-Adapter -VMName 'vm-inplace-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+    # Phase 1 done: new cluster and new VDS, still on the old storage.
+    'vm-phase1-01'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-phase1-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
 
-    # In the target cluster and on target storage, but still on the old VDS port group.
-    'vm-netonly-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
+    # Phase 2 done: new cluster, new VDS, new storage - ready for the cross vCenter move.
+    'vm-phase2-01'  = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-NEW-01'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-phase2-01' -Name 'Network adapter 1' -NetworkName 'PG-NEW-Prod-100' -PortgroupKey 'dvpg-new-100')) }
+
+    # In the new cluster but still on the old VDS port group.
+    'vm-netonly-01' = @{ Host = 'esx-new-01.corp.local'; Datastore = 'DS-OLD-01'; UsedSpaceGB = 30
         Adapters = @((script:New-Adapter -VMName 'vm-netonly-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
+
+    # On storage the new cluster cannot see - phase 1 must refuse this one.
+    'vm-nosan-01'   = @{ Host = 'esx-old-01.corp.local'; Datastore = 'DS-ISOLATED'; UsedSpaceGB = 30
+        Adapters = @((script:New-Adapter -VMName 'vm-nosan-01' -Name 'Network adapter 1' -NetworkName 'PG-OLD-Prod-100' -PortgroupKey 'dvpg-old-100')) }
 }
+
+#region Inventory state that survives between runs --------------------------------
+
+# Each phase runs as its own process, so the effect of a migration is written to
+# $env:BVM_FAKE_STATE. Without that the three phase journey could not be tested: phase 3
+# would still see the VM where it was before phase 1.
+
+function script:Restore-FakeState {
+    if (-not $env:BVM_FAKE_STATE -or -not (Test-Path -LiteralPath $env:BVM_FAKE_STATE)) { return }
+
+    $saved = Get-Content -LiteralPath $env:BVM_FAKE_STATE -Raw | ConvertFrom-Json
+    foreach ($entry in $saved.PSObject.Properties) {
+        $name = $entry.Name
+        if (-not $script:VMs.ContainsKey($name)) { continue }
+
+        $script:VMs[$name].Host      = $entry.Value.Host
+        $script:VMs[$name].Datastore = $entry.Value.Datastore
+
+        foreach ($savedAdapter in @($entry.Value.Adapters)) {
+            $adapter = $script:VMs[$name].Adapters | Where-Object { $_.Name -eq $savedAdapter.Name } | Select-Object -First 1
+            if (-not $adapter) { continue }
+            $adapter.NetworkName = $savedAdapter.NetworkName
+            $adapter.ExtensionData.Backing.Port.PortgroupKey = $savedAdapter.PortgroupKey
+        }
+    }
+}
+
+function script:Save-FakeState {
+    if (-not $env:BVM_FAKE_STATE) { return }
+
+    $state = [ordered]@{}
+    foreach ($name in ($script:VMs.Keys | Sort-Object)) {
+        $state[$name] = [ordered]@{
+            Host      = $script:VMs[$name].Host
+            Datastore = $script:VMs[$name].Datastore
+            Adapters  = @($script:VMs[$name].Adapters | ForEach-Object {
+                    [ordered]@{
+                        Name         = $_.Name
+                        NetworkName  = $_.NetworkName
+                        PortgroupKey = $_.ExtensionData.Backing.Port.PortgroupKey
+                    }
+                })
+        }
+    }
+    $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $env:BVM_FAKE_STATE
+}
+
+script:Restore-FakeState
+
+#endregion Inventory state that survives between runs
 
 function script:Write-FakeLog {
     param([string]$Line)
@@ -111,11 +215,8 @@ function Get-Cluster {
     [CmdletBinding()]
     param([string]$Name, $VMHost, $Server)
 
-    if ($VMHost) {
-        $cluster = if ($VMHost.Name -like 'esx-new-*') { 'CL-NEW-01' } else { 'CL-OLD-01' }
-        return [pscustomobject]@{ Name = $cluster }
-    }
-    if ($Name -eq 'CL-NEW-01') { return [pscustomobject]@{ Name = 'CL-NEW-01' } }
+    if ($VMHost) { return [pscustomobject]@{ Name = $script:HostCluster[$VMHost.Name] } }
+    if ($Name -and ($script:HostCluster.Values -contains $Name)) { return [pscustomobject]@{ Name = $Name } }
     return $null
 }
 
@@ -123,12 +224,9 @@ function Get-VMHost {
     [CmdletBinding()]
     param([string]$Name, $Location, $Server)
 
-    $hosts = @(
-        [pscustomobject]@{ Name = 'esx-new-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 300 }
-        [pscustomobject]@{ Name = 'esx-new-02.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
-    )
-    if ($Name) { return @($hosts | Where-Object { $_.Name -eq $Name }) }
-    return $hosts
+    if ($Name) { return @($script:Hosts | Where-Object { $_.Name -eq $Name }) }
+    if ($Location) { return @($script:Hosts | Where-Object { $script:HostCluster[$_.Name] -eq $Location.Name }) }
+    return $script:Hosts
 }
 
 function Get-DatastoreCluster {
@@ -139,15 +237,34 @@ function Get-DatastoreCluster {
 
 function Get-Datastore {
     [CmdletBinding()]
-    param([string]$Name, $VM, $Location, $Server)
+    param([string]$Name, $VM, $VMHost, $Location, $Server)
 
     # Which datastores is this VM on today?
-    if ($VM) { return [pscustomobject]@{ Name = $script:VMs[$VM.Name].Datastore } }
+    if ($VM) { return [pscustomobject]@{ Name = $script:VMs[$VM.Name].Datastore; FreeSpaceGB = 5000 } }
+
+    # Which datastores can this host see?
+    if ($VMHost) {
+        return @($script:HostDatastores[$VMHost.Name] | ForEach-Object {
+                [pscustomobject]@{ Name = $_; FreeSpaceGB = $script:Datastores[$_] }
+            })
+    }
 
     # Members of a datastore cluster - there are none in this inventory.
     if ($Location) { return @() }
 
-    if ($Name -eq 'DS-NEW-01') { return [pscustomobject]@{ Name = 'DS-NEW-01'; FreeSpaceGB = 5000 } }
+    if ($Name -and $script:Datastores.ContainsKey($Name)) {
+        $viServer = if ($Server) { [string]$Server.Name } else { 'vc-old.corp.local' }
+        $available = if ($script:DatastoresByVIServer.ContainsKey($viServer)) { $script:DatastoresByVIServer[$viServer] } else { @() }
+        if ($Name -in $available) {
+            return [pscustomobject]@{ Name = $Name; FreeSpaceGB = $script:Datastores[$Name] }
+        }
+    }
+    return @()
+}
+
+function Get-Folder {
+    [CmdletBinding()]
+    param([string]$Name, [string]$Type, $Server)
     return @()
 }
 
@@ -156,12 +273,13 @@ function Set-NetworkAdapter {
     param($NetworkAdapter, $Portgroup, [switch]$Confirm)
 
     script:Write-FakeLog -Line ('SETNIC {0} {1} -> {2}' -f $NetworkAdapter.Parent, $NetworkAdapter.Name, $Portgroup.Name)
-}
 
-function Get-Folder {
-    [CmdletBinding()]
-    param([string]$Name, [string]$Type, $Server)
-    return @()
+    $adapter = $script:VMs[$NetworkAdapter.Parent].Adapters | Where-Object { $_.Name -eq $NetworkAdapter.Name } | Select-Object -First 1
+    if ($adapter) {
+        $adapter.NetworkName = $Portgroup.Name
+        $adapter.ExtensionData.Backing.Port.PortgroupKey = $Portgroup.Key
+    }
+    script:Save-FakeState
 }
 
 function Move-VM {
@@ -174,7 +292,22 @@ function Move-VM {
     if ($VM.Name -eq 'vm-fail-start') { throw 'Simulated failure while starting the migration.' }
 
     script:Write-FakeLog -Line ('MOVE {0} -> host={1} datastore={2} portgroups={3}' -f `
-            $VM.Name, $Destination.Name, $(if ($Datastore) { $Datastore.Name } else { 'none' }), (($PortGroup | ForEach-Object { $_.Name }) -join '+'))
+            $VM.Name,
+        $(if ($Destination) { $Destination.Name } else { 'none' }),
+        $(if ($Datastore) { $Datastore.Name } else { 'none' }),
+        $(if ($PortGroup) { (($PortGroup | ForEach-Object { $_.Name }) -join '+') } else { 'none' }))
+
+    # Apply the migration to the inventory, so the next phase sees where the VM ended up.
+    if ($Destination) { $script:VMs[$VM.Name].Host = $Destination.Name }
+    if ($Datastore) { $script:VMs[$VM.Name].Datastore = $Datastore.Name }
+    if ($PortGroup) {
+        $targets = @($PortGroup)
+        for ($i = 0; $i -lt $targets.Count -and $i -lt $script:VMs[$VM.Name].Adapters.Count; $i++) {
+            $script:VMs[$VM.Name].Adapters[$i].NetworkName = $targets[$i].Name
+            $script:VMs[$VM.Name].Adapters[$i].ExtensionData.Backing.Port.PortgroupKey = $targets[$i].Key
+        }
+    }
+    script:Save-FakeState
 
     $script:TaskCounter++
     $id = 'Task-task-{0}' -f $script:TaskCounter

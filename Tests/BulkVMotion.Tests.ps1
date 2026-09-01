@@ -347,3 +347,170 @@ Describe 'Module surface' {
         }
     }
 }
+
+Describe 'Get-CsvNextPhase' {
+
+    BeforeAll {
+        function New-PhaseRow {
+            param([string]$VMName, [int]$PhaseCompleted)
+            [pscustomobject]@{ VMName = $VMName; PhaseCompleted = $PhaseCompleted }
+        }
+    }
+
+    It 'starts a fresh file at phase 1' {
+        $result = Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 0), (New-PhaseRow -VMName 'vm-b' -PhaseCompleted 0))
+
+        $result.Phase      | Should -Be 1
+        $result.IsComplete | Should -BeFalse
+        $result.Reason     | Should -BeNullOrEmpty
+    }
+
+    It 'moves a file on to the next phase once every row has the current one behind it' {
+        (Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 1), (New-PhaseRow -VMName 'vm-b' -PhaseCompleted 1))).Phase | Should -Be 2
+        (Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 2))).Phase | Should -Be 3
+    }
+
+    It 'stays on the current phase while any row is behind' {
+        # Eight VMs made it through phase 1, two did not: still a phase 1 file.
+        $rows = @(1..8 | ForEach-Object { New-PhaseRow -VMName "vm-$_" -PhaseCompleted 1 }) +
+                @(9..10 | ForEach-Object { New-PhaseRow -VMName "vm-$_" -PhaseCompleted 0 })
+
+        (Get-CsvNextPhase -Row $rows).Phase | Should -Be 1
+    }
+
+    It 'reports a wave where every VM has finished phase 3' {
+        $result = Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 3))
+
+        $result.IsComplete | Should -BeTrue
+        $result.Phase      | Should -Be 4
+    }
+
+    It 'refuses the file when the run asserts a different phase' {
+        $result = Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 1)) -Assert 1
+
+        $result.Reason | Should -Match 'due for phase 2 but the run was started with -Phase 1'
+    }
+
+    It 'accepts the file when the asserted phase agrees' {
+        (Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 1)) -Assert 2).Reason | Should -BeNullOrEmpty
+    }
+
+    It 'asserts nothing when the run did not state a phase' {
+        (Get-CsvNextPhase -Row @((New-PhaseRow -VMName 'vm-a' -PhaseCompleted 1)) -Assert 0).Reason | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-PhaseRowValue' {
+
+    It 'prefers the phase column over the generic one and the default' {
+        $row = [pscustomobject]@{ Phase1Cluster = 'CL-PHASE'; TargetCluster = 'CL-GENERIC' }
+
+        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-PHASE'
+    }
+
+    It 'falls back to the generic column, then to the run default' {
+        $row = [pscustomobject]@{ Phase1Cluster = ''; TargetCluster = 'CL-GENERIC' }
+        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-GENERIC'
+
+        $empty = [pscustomobject]@{ Phase1Cluster = ''; TargetCluster = '' }
+        Get-PhaseRowValue -Row $empty -PhaseColumn 'Phase1Cluster' -GenericColumn 'TargetCluster' -Default 'CL-DEFAULT' | Should -Be 'CL-DEFAULT'
+    }
+
+    It 'copes with a column the file does not have at all' {
+        $row = [pscustomobject]@{ VMName = 'vm-a' }
+        Get-PhaseRowValue -Row $row -PhaseColumn 'Phase2Datastore' -Default 'DS-DEFAULT' | Should -Be 'DS-DEFAULT'
+    }
+}
+
+Describe 'Update-MigrationCsv' {
+
+    BeforeEach {
+        $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('bvm-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:TestRoot -Force | Out-Null
+        $script:CsvPath = Join-Path $script:TestRoot 'wave1.csv'
+        "VMName,Notes`nvm-a,keep me`nvm-b,and me" | Set-Content -LiteralPath $script:CsvPath
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'records the outcome on the right row and leaves the other one alone' {
+        Update-MigrationCsv -Path $script:CsvPath -Update @(
+            [pscustomobject]@{
+                CsvLine = 2; PhaseCompleted = 1; CompletedAt = '2026-09-01 10:00:00'
+                ResultVIServer = 'vc.corp.local'; ResultCluster = 'CL-NEW-01'
+                ResultHost = 'esx-new-01'; ResultDatastore = 'DS-OLD-01'; ResultPortGroup = 'PG-NEW-Prod-100'
+            }
+        )
+
+        $rows = @(Import-Csv -LiteralPath $script:CsvPath)
+        $rows.Count | Should -Be 2
+
+        $done = $rows | Where-Object { $_.VMName -eq 'vm-a' }
+        $done.PhaseCompleted  | Should -Be '1'
+        $done.ResultCluster   | Should -Be 'CL-NEW-01'
+        $done.ResultPortGroup | Should -Be 'PG-NEW-Prod-100'
+        $done.Notes           | Should -Be 'keep me'
+
+        # The row that did not complete stays at 0 so a re-run picks it up.
+        ($rows | Where-Object { $_.VMName -eq 'vm-b' }).PhaseCompleted | Should -Be '0'
+    }
+
+    It 'keeps the author columns and the row order' {
+        Update-MigrationCsv -Path $script:CsvPath -Update @(
+            [pscustomobject]@{ CsvLine = 3; PhaseCompleted = 1; CompletedAt = 'now' }
+        )
+
+        $rows = @(Import-Csv -LiteralPath $script:CsvPath)
+        $rows[0].VMName | Should -Be 'vm-a'
+        $rows[1].VMName | Should -Be 'vm-b'
+        $rows[1].Notes  | Should -Be 'and me'
+        # Every row carries every column, so Export-Csv cannot drop one.
+        $rows[0].PSObject.Properties.Name | Should -Contain 'ResultCluster'
+    }
+
+    It 'does nothing when there is nothing to record' {
+        $before = Get-Content -LiteralPath $script:CsvPath -Raw
+        Update-MigrationCsv -Path $script:CsvPath -Update @()
+        Get-Content -LiteralPath $script:CsvPath -Raw | Should -Be $before
+    }
+
+    It 'can be applied twice, the second phase overwriting the first' {
+        Update-MigrationCsv -Path $script:CsvPath -Update @([pscustomobject]@{ CsvLine = 2; PhaseCompleted = 1; ResultDatastore = 'DS-OLD-01' })
+        Update-MigrationCsv -Path $script:CsvPath -Update @([pscustomobject]@{ CsvLine = 2; PhaseCompleted = 2; ResultDatastore = 'DS-NEW-01' })
+
+        $row = @(Import-Csv -LiteralPath $script:CsvPath) | Where-Object { $_.VMName -eq 'vm-a' }
+        $row.PhaseCompleted  | Should -Be '2'
+        $row.ResultDatastore | Should -Be 'DS-NEW-01'
+    }
+}
+
+Describe 'Import-MigrationCsv phase column' {
+
+    BeforeEach {
+        $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('bvm-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:TestRoot -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'reads PhaseCompleted as a number and defaults it to 0' {
+        $path = Join-Path $script:TestRoot 'phases.csv'
+        "VMName,PhaseCompleted`nvm-a,2`nvm-b," | Set-Content -LiteralPath $path
+
+        $rows = @(Import-MigrationCsv -Path $path)
+
+        $rows[0].PhaseCompleted | Should -Be 2
+        $rows[1].PhaseCompleted | Should -Be 0
+    }
+
+    It 'throws on a PhaseCompleted value that is not a phase' {
+        $path = Join-Path $script:TestRoot 'bad-phase.csv'
+        "VMName,PhaseCompleted`nvm-a,later" | Set-Content -LiteralPath $path
+
+        { Import-MigrationCsv -Path $path } | Should -Throw '*invalid PhaseCompleted*'
+    }
+}

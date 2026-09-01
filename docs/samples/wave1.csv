@@ -1,5 +1,5 @@
-VMName,SourceCluster,TargetCluster,TargetHost,TargetDatastore,TargetFolder,TargetPortGroup,Notes
-vm-app-01,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,,,Standard migration - port group found by VLAN
-vm-app-02,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,,,
-vm-db-01,CL-OLD-01,CL-NEW-01,esx-new-04.corp.local,DS-NEW-SQL-01,Databases,,Pinned to one host and one datastore
-vm-dmz-01,CL-OLD-02,CL-NEW-02,,DSC-NEW-DMZ,,PG-NEW-DMZ-Web,VLAN is ambiguous on the new VDS so the port group is named explicitly
+VMName,SourceCluster,Phase1Cluster,Phase1PortGroup,Phase2Datastore,Phase3Cluster,Phase3PortGroup,Notes
+vm-app-01,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,Port groups found by VLAN in both phase 1 and phase 3
+vm-app-02,CL-OLD-01,CL-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,,
+vm-db-01,CL-OLD-01,CL-NEW-01,,DS-NEW-SQL-01,CL-FINAL-01,,Its own datastore in phase 2
+vm-dmz-01,CL-OLD-02,CL-NEW-02,PG-NEW-DMZ-Web,DSC-NEW-DMZ,CL-FINAL-02,PG-VC2-DMZ-Web,VLAN is ambiguous on both new switches so the port groups are named

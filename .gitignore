@@ -1,8 +1,12 @@
 # Working folders are tracked, the data that flows through them is not.
 IN/*
 !IN/.gitkeep
-MOVED/*
-!MOVED/.gitkeep
+Phase1/*
+!Phase1/.gitkeep
+Phase2/*
+!Phase2/.gitkeep
+Phase3/*
+!Phase3/.gitkeep
 LOGS/*
 !LOGS/.gitkeep
 
