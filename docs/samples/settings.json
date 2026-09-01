@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to config/settings.json to avoid typing the same arguments on every run. Anything passed on the command line overrides what is set here.",
+
+  "SourceVIServer": "vc-old.corp.local",
+  "TargetVIServer": "vc-new.corp.local",
+
+  "TargetVDSwitch": [ "VDS-NEW-01" ],
+
+  "DefaultTargetCluster": "CL-NEW-01",
+  "DefaultTargetDatastore": "DSC-NEW-PROD",
+  "DefaultTargetFolder": "",
+
+  "MaxConcurrentMigrations": 2,
+  "MigrationTimeoutMinutes": 120,
+  "PollIntervalSeconds": 15,
+  "VMotionPriority": "High",
+  "DiskStorageFormat": "AsDefined",
+  "DatastoreReserveGB": 100,
+  "MoveCsvWhen": "AllSuccess",
+  "LogLevel": "Info"
+}

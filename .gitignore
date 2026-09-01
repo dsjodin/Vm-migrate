@@ -1,0 +1,11 @@
+# Working folders are tracked, the data that flows through them is not.
+IN/*
+!IN/.gitkeep
+MOVED/*
+!MOVED/.gitkeep
+LOGS/*
+!LOGS/.gitkeep
+
+# Local configuration holds vCenter names and other site specifics.
+config/settings.json
+config/portgroup-exceptions.csv

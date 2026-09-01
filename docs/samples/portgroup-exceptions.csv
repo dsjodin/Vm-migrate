@@ -1,0 +1,3 @@
+SourcePortGroup,TargetPortGroup,Comment
+PG-OLD-DMZ-Web,PG-NEW-DMZ-Web,VLAN reused for something else on the new VDS - pin it by name
+PG-OLD-NSX-Transit,PG-NEW-Transit-900,Opaque network on the source side has no readable VLAN
