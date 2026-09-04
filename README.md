@@ -107,6 +107,50 @@ What gets written, and where:
 The dry run row is the one to remember: it is the only write that happens without the wave
 being claimed, and what it writes is what you review before committing to the migration.
 
+## What a run does
+
+One run migrates one wave through one phase. The order matters in a couple of places: the
+log is open before anything else, so even a run that fails at the first hurdle leaves a
+record; and the wave is only claimed once the vCenter connection is up, so a failed logon
+never leaves a wave locked in `Running/`.
+
+```mermaid
+sequenceDiagram
+    participant Eng as Engineer
+    participant Run as Invoke-BulkVMotion
+    participant Wave as Wave CSV
+    participant VC as vCenter
+    participant Logs as LOGS folder
+
+    Eng->>Run: run it with -Phase 2
+    Run->>Logs: open the run log
+    Run->>Wave: read every wave in IN, Running, Phase1 and Phase2
+    Run->>Eng: list the waves due for phase 2
+    Eng->>Run: pick one
+    Run->>VC: connect using your stored credential
+    Run->>Wave: move it into Running, write the run marker
+
+    loop each VM, in wave order
+        Run->>VC: resolve the VM, its host, datastore and port groups
+        Run->>VC: read what is already migrating, yours and other engineers
+        alt fits the host, datastore and network budget
+            Run->>VC: start the migration
+        else budget full
+            Run->>Run: hold this VM, try the next one
+        end
+    end
+
+    VC-->>Run: migrations finish
+    Run->>Logs: write the per VM result CSV
+    Run->>Wave: record PhaseCompleted, CompletedBy and the port groups
+    Run->>Wave: move to the folder for the lowest phase all VMs have done
+    Run->>VC: disconnect
+    Run->>Eng: summary of migrated, already done and failed
+```
+
+`-ValidateOnly` stops after the resolve step: it never claims the wave, never starts a
+migration, and writes only the `PhaseNPortGroups` column back.
+
 ## Phase 1: cluster and VDS
 
 vMotion to the new cluster and remap every NIC onto the new VDS by VLAN. Storage does not
