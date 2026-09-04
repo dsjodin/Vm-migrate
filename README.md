@@ -22,7 +22,8 @@ Phase3/   waves that are fully migrated
 LOGS/     one .log per run + one result CSV per wave per phase
 ```
 
-When the next wave is due, move the file from `Phase1` back into `IN` and run phase 2.
+When the next wave is due you just run the next phase and pick the wave from the list -
+nothing is moved by hand.
 
 ## Before your first run
 
@@ -64,21 +65,33 @@ that wave has got.
 
 ```mermaid
 graph TD
-    A[Engineer authors the wave CSV] --> IN[IN folder: waiting for its next phase]
+    A[Engineer authors the wave CSV] --> IN[IN folder: a VM still has phase 1 to do]
     IN -->|ValidateOnly| DRY[Dry run: writes PhaseNPortGroups only]
     DRY --> IN
-    IN -->|engineer picks it, run marker written| RUN[Running folder: claimed by one engineer]
-    RUN -->|a VM failed, or the run died| IN
-    RUN -->|every row reached the phase| WHICH{which phase just finished}
-    WHICH -->|phase 1| P1[Phase1 folder]
-    WHICH -->|phase 2| P2[Phase2 folder]
-    WHICH -->|phase 3| P3[Phase3 folder: fully migrated]
-    P1 -->|you move it back for the storage wave| IN
-    P2 -->|you move it back for the cross vCenter wave| IN
+    IN -->|you pick it for phase 1| RUN[Running folder: claimed by one engineer]
+    P1[Phase1 folder: every VM has done phase 1] -->|you pick it for phase 2| RUN
+    P2[Phase2 folder: every VM has done phase 2] -->|you pick it for phase 3| RUN
+    RUN --> HOME{lowest phase all VMs have done}
+    HOME -->|none yet| IN
+    HOME -->|phase 1| P1
+    HOME -->|phase 2| P2
+    HOME -->|phase 3| P3[Phase3 folder: fully migrated]
 ```
 
-The two arrows out of `Phase1/` and `Phase2/` are the only manual steps: nothing moves a
-wave on to its next phase by itself.
+No file is ever moved by hand. A wave always sits in the folder matching the lowest phase
+**all** of its VMs have completed, and the run works that out from the file itself:
+
+| Folder | Meaning |
+| --- | --- |
+| `IN/` | at least one VM has not completed phase 1 |
+| `Phase1/` | every VM has completed phase 1, at least one has not completed phase 2 |
+| `Phase2/` | every VM has completed phase 2 |
+| `Phase3/` | fully migrated |
+
+So a phase 2 run lists the waves sitting in `Phase1/` and you pick one. A wave that comes
+back with failures returns to the folder it belongs in, and the picker shows how far it
+got - `12 VM(s), 8 done` - so you can see there is work outstanding without hunting for
+the file. Put a wave in the wrong folder by hand and the next run puts it right.
 
 What gets written, and where:
 
@@ -171,22 +184,18 @@ VMName,...,Phase1PortGroups,PhaseCompleted,CompletedAt,CompletedBy,ResultVIServe
 vm-app-01,...,"Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300",1,2026-09-01 21:14:02,dsjodin,vc.corp.local,CL-NEW-01,esx-new-03.corp.local,
 ```
 
-`ResultDatastore` is empty on purpose: phase 1 does not move storage. Leave the file in
-`Phase1/` until the storage wave is due.
+`ResultDatastore` is empty on purpose: phase 1 does not move storage. Leave the file where
+it is; the storage wave will list it when you run phase 2.
 
 ## Phase 2: storage
 
 Storage vMotion onto the new datastore, thin provisioned. The VMs stay on their hosts and
 their networking is not touched. Two per host at a time, eight per datastore.
 
-**1. Bring the wave back.** Move it out of `Phase1/` into `IN/`:
-
-```powershell
-Move-Item .\Phase1\wave-app-01.csv .\IN\
-```
-
-The only column phase 2 reads is `Phase2Datastore`. If you left it blank, fill it in now,
-or set `DefaultTargetDatastore` in the config.
+**1. Nothing to move.** The wave is sitting in `Phase1/` where the phase 1 run left it, and
+a phase 2 run lists it for you. The only column phase 2 reads is `Phase2Datastore`; if you
+left it blank, fill it in now (the file is in `Phase1/`), or set `DefaultTargetDatastore`
+in the config.
 
 **2. Dry run.**
 
@@ -236,13 +245,8 @@ Cross vCenter vMotion to the new vCenter and cluster. The datastore is the same 
 volume, so no data moves - but a VDS cannot span vCenters, so the port groups are remapped
 by VLAN a second time.
 
-**1. Bring the wave back.**
-
-```powershell
-Move-Item .\Phase2\wave-app-01.csv .\IN\
-```
-
-Phase 3 reads `Phase3Cluster` and `Phase3VDS`.
+**1. Nothing to move.** The wave is in `Phase2/` and a phase 3 run lists it. Phase 3 reads
+`Phase3Cluster` and `Phase3VDS`.
 
 **2. Dry run.** This one needs both vCenters:
 
@@ -358,8 +362,9 @@ move it another way. Phase 1 deliberately never moves disks.
           and run phase 1 again - the VMs that are done will be skipped.
 ```
 
-A wave only moves on once every row has reached the phase. The rows that succeeded already
-carry `PhaseCompleted,1`:
+A wave only moves on once every row has reached the phase, so it stays in the folder for
+the phase all of its VMs have completed - `IN/` here, because some VMs have not finished
+phase 1. The rows that succeeded already carry `PhaseCompleted,1`:
 
 ```csv
 vm-app-01,...,1,2026-09-01 15:26:26,dsjodin,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,,"Network adapter 1=PG-NEW-Prod-100"

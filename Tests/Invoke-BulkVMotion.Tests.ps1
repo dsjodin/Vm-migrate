@@ -412,7 +412,10 @@ Describe 'Phase 2 - storage only' {
         # Nothing can start and nothing is running, so the run says so rather than hanging.
         $run.Output | Should -Match 'blocked by a resource limit|Blocked by a resource limit'
         (Get-Calls -Paths $script:Paths | Where-Object { $_ -like 'MOVE *' }).Count | Should -Be 0
-        (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
+        # Every VM still has phase 1 behind it, so the wave belongs in Phase1 and is
+        # offered again next time phase 2 is run.
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
+        (Get-RunningFiles -Paths $script:Paths).Count        | Should -Be 0
     }
 
     It 'ignores other engineers when told to' {
@@ -623,6 +626,69 @@ Describe 'Waves on a shared mgmt server' {
         $log.Name | Should -BeLike "*$env:USERNAME*"
     }
 
+    It 'picks up a wave waiting in Phase1 without anything being moved by hand' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase2Datastore'
+            'vm-phase1-01,1,DS-NEW-01'
+        )
+        # Put it where a phase 1 run would have left it.
+        $phase1 = Join-Path $script:Paths.Archive 'Phase1'
+        New-Item -ItemType Directory -Path $phase1 -Force | Out-Null
+        Move-Item -LiteralPath $script:Paths.Csv -Destination $phase1
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2
+
+        $run.ExitCode | Should -Be 0
+        (Get-PhaseFiles -Paths $script:Paths -Phase 2).Count | Should -Be 1
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 0
+    }
+
+    It 'returns a part finished phase 2 wave to Phase1, not to IN' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase2Datastore'
+            'vm-phase1-01,1,DS-NEW-01'
+            'vm-phase1-02,1,'
+        )
+        $phase1 = Join-Path $script:Paths.Archive 'Phase1'
+        New-Item -ItemType Directory -Path $phase1 -Force | Out-Null
+        Move-Item -LiteralPath $script:Paths.Csv -Destination $phase1
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2
+
+        $run.ExitCode | Should -Be 1
+        # Every VM has phase 1 behind it, so Phase1 is where the wave belongs - putting it
+        # in IN would read as though it had never started.
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
+        (Get-InFiles -Paths $script:Paths).Count             | Should -Be 0
+        (Get-RunningFiles -Paths $script:Paths).Count        | Should -Be 0
+
+        $rows = Import-Csv -LiteralPath (Get-PhaseFiles -Paths $script:Paths -Phase 1)[0].FullName
+        ($rows | Where-Object { $_.VMName -eq 'vm-phase1-01' }).PhaseCompleted | Should -Be '2'
+        ($rows | Where-Object { $_.VMName -eq 'vm-phase1-02' }).PhaseCompleted | Should -Be '1'
+    }
+
+    It 'still returns a part finished phase 1 wave to IN' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-dmz-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-InFiles -Paths $script:Paths).Count             | Should -Be 1
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 0
+    }
+
+    It 'does not offer a wave that has finished phase 3' {
+        $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase2-01,3')
+        $phase3 = Join-Path $script:Paths.Archive 'Phase3'
+        New-Item -ItemType Directory -Path $phase3 -Force | Out-Null
+        Move-Item -LiteralPath $script:Paths.Csv -Destination $phase3
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 3
+
+        $run.ExitCode | Should -Be 2
+        $run.Output   | Should -Match 'needs exactly one runnable wave, but there are 0'
+    }
+
     It 'reports a broken CSV and leaves it in IN' {
         $script:Paths = New-TestRun -CsvContent @('Name,Cluster', 'vm-app-01,CL-NEW-01')
 
@@ -632,19 +698,23 @@ Describe 'Waves on a shared mgmt server' {
         (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
     }
 
-    It 'carries one wave through all three phases' {
+    It 'carries one wave through all three phases with no file moved by hand' {
         $script:Paths = New-TestRun -CsvContent @('VMName,Phase2Datastore', 'vm-app-01,DS-NEW-01')
 
+        # There is deliberately no Move-Item anywhere in this test. Each phase finds the
+        # wave where the previous one left it; if that ever regresses, this fails.
         (Invoke-Runner -Paths $script:Paths -Phase 1).ExitCode | Should -Be 0
         $afterPhase1 = Get-PhaseFiles -Paths $script:Paths -Phase 1 | Select-Object -First 1
+        $afterPhase1 | Should -Not -BeNullOrEmpty
         (Import-Csv -LiteralPath $afterPhase1.FullName)[0].Phase1PortGroups | Should -Be 'Network adapter 1=PG-NEW-Prod-100'
 
-        Move-Item -LiteralPath $afterPhase1.FullName -Destination $script:Paths.Csv
         (Invoke-Runner -Paths $script:Paths -Phase 2).ExitCode | Should -Be 0
         $afterPhase2 = Get-PhaseFiles -Paths $script:Paths -Phase 2 | Select-Object -First 1
+        $afterPhase2 | Should -Not -BeNullOrEmpty
         (Import-Csv -LiteralPath $afterPhase2.FullName)[0].PhaseCompleted | Should -Be '2'
+        # It left Phase1 on its own.
+        (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 0
 
-        Move-Item -LiteralPath $afterPhase2.FullName -Destination $script:Paths.Csv
         (Invoke-Runner -Paths $script:Paths -Phase 3).ExitCode | Should -Be 0
 
         $final = Get-ArchivedCsv -Paths $script:Paths -Phase 3 | Select-Object -First 1

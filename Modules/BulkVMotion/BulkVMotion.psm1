@@ -685,13 +685,23 @@ function Get-AvailableWave {
     param(
         [Parameter(Mandatory)][string]$InFolder,
         [Parameter(Mandatory)][string]$RunningFolder,
+        # Phase1 and Phase2 live under here. Waves waiting for their next phase sit in
+        # them, so they are listed from there rather than being moved back by hand.
+        [string]$ArchiveRoot,
         [ValidateRange(0, 3)][int]$Phase = 0
     )
 
+    $folders = @($InFolder, $RunningFolder)
+    if ($ArchiveRoot) {
+        # Phase3 is deliberately not scanned: those waves are finished, and listing every
+        # one of them forever would bury the waves still in flight.
+        $folders += @(1, 2 | ForEach-Object { Join-Path $ArchiveRoot ('Phase{0}' -f $_) })
+    }
+
     $files = @()
-    $files += @(Get-ChildItem -LiteralPath $InFolder -Filter '*.csv' -File -ErrorAction SilentlyContinue)
-    if (Test-Path -LiteralPath $RunningFolder) {
-        $files += @(Get-ChildItem -LiteralPath $RunningFolder -Filter '*.csv' -File -ErrorAction SilentlyContinue)
+    foreach ($folder in $folders) {
+        if (-not (Test-Path -LiteralPath $folder)) { continue }
+        $files += @(Get-ChildItem -LiteralPath $folder -Filter '*.csv' -File -ErrorAction SilentlyContinue)
     }
 
     foreach ($file in ($files | Sort-Object Name)) {
@@ -701,6 +711,7 @@ function Get-AvailableWave {
             InRunning   = ($file.DirectoryName -eq (Resolve-Path -LiteralPath $RunningFolder -ErrorAction SilentlyContinue).Path)
             Rows        = @()
             VMCount     = 0
+            DoneCount   = 0
             NextPhase   = 0
             PhaseInfo   = $null
             State       = 'Ready'
@@ -714,6 +725,8 @@ function Get-AvailableWave {
             $wave.VMCount   = $wave.Rows.Count
             $wave.PhaseInfo = Get-CsvNextPhase -Row $wave.Rows
             $wave.NextPhase = $wave.PhaseInfo.Phase
+            # Rows already past the phase this wave is due for - a part finished wave.
+            $wave.DoneCount = @($wave.Rows | Where-Object { [int]$_.PhaseCompleted -ge $wave.NextPhase }).Count
         }
         catch {
             $wave.State       = 'Invalid'
@@ -801,8 +814,14 @@ function Show-WavePicker {
         }
 
         $detail = if ($item.StateDetail) { ' - {0}' -f $item.StateDetail } else { '' }
-        Write-Host ('{0} {1,-34} {2,3} VM(s)  phase {3}  {4}{5}' -f `
-                $label, $item.Name, $item.VMCount, $item.NextPhase, $item.State, $detail) -ForegroundColor $colour
+        $progress = if ($item.DoneCount -gt 0 -and $item.DoneCount -lt $item.VMCount) {
+            '{0,3} VM(s), {1} done' -f $item.VMCount, $item.DoneCount
+        }
+        else {
+            '{0,3} VM(s)        ' -f $item.VMCount
+        }
+        Write-Host ('{0} {1,-30} {2}  phase {3}  {4}{5}' -f `
+                $label, $item.Name, $progress, $item.NextPhase, $item.State, $detail) -ForegroundColor $colour
     }
 
     Write-Host ('-' * 96) -ForegroundColor Cyan

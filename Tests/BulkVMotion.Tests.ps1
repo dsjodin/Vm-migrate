@@ -789,6 +789,39 @@ Describe 'Wave state' {
         $alive.Reason | Should -Match 'OTHER-MGMT-01'
     }
 
+    It 'lists a wave waiting in Phase1 as due for phase 2' {
+        $phase1 = Join-Path $script:TestRoot 'Phase1'
+        New-Item -ItemType Directory -Path $phase1 -Force | Out-Null
+        "VMName,PhaseCompleted`nvm-a,1" | Set-Content -LiteralPath (Join-Path $phase1 'wave1.csv')
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -ArchiveRoot $script:TestRoot -Phase 2)
+
+        # No file was moved to get here - it is offered from where phase 1 left it.
+        $wave.Count        | Should -Be 1
+        $wave[0].NextPhase | Should -Be 2
+        $wave[0].State     | Should -Be 'Ready'
+        $wave[0].Selectable | Should -BeTrue
+    }
+
+    It 'does not list waves that have finished phase 3' {
+        $phase3 = Join-Path $script:TestRoot 'Phase3'
+        New-Item -ItemType Directory -Path $phase3 -Force | Out-Null
+        "VMName,PhaseCompleted`nvm-a,3" | Set-Content -LiteralPath (Join-Path $phase3 'done.csv')
+
+        @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -ArchiveRoot $script:TestRoot).Count |
+            Should -Be 0
+    }
+
+    It 'counts how many rows are already through the phase the wave is due for' {
+        "VMName,PhaseCompleted`nvm-a,1`nvm-b,1`nvm-c,0" | Set-Content -LiteralPath (Join-Path $script:InDir 'part.csv')
+
+        $wave = @(Get-AvailableWave -InFolder $script:InDir -RunningFolder $script:RunningDir -Phase 1)[0]
+
+        $wave.NextPhase | Should -Be 1
+        $wave.VMCount   | Should -Be 3
+        $wave.DoneCount | Should -Be 2
+    }
+
     It 'reports a wave that cannot be read as invalid rather than throwing' {
         "Name,Cluster`nvm-a,CL" | Set-Content -LiteralPath (Join-Path $script:InDir 'broken.csv')
 

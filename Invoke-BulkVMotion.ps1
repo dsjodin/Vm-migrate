@@ -195,6 +195,28 @@ Import-Module (Join-Path (Join-Path (Join-Path $scriptRoot 'Modules') 'BulkVMoti
 $engineer = if ($env:USERNAME) { $env:USERNAME } else { 'unknown' }
 $logFile  = Start-BulkVMotionLog -LogDirectory $LogFolder -Name ('bulk-vmotion_{0}' -f $engineer) -MinimumLevel $LogLevel
 
+function Get-WaveHomeFolder {
+    <#
+        A wave lives in the folder matching the lowest phase all of its rows have
+        completed: IN while any VM still has phase 1 to do, Phase1 once every VM has
+        finished phase 1, and so on. Derived from the file itself, so nobody has to move
+        a wave between phases and one put in the wrong place by hand is corrected by the
+        next run.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $lowest = (Get-CsvNextPhase -Row @(Import-MigrationCsv -Path $Path)).Phase - 1
+    }
+    catch {
+        # Cannot be read, so it needs a human: IN is where they will look.
+        return $InFolder
+    }
+
+    if ($lowest -le 0) { return $InFolder }
+    return (Join-Path $ArchiveRoot ('Phase{0}' -f [math]::Min($lowest, 3)))
+}
+
 $sourceServer = $null
 $targetServer = $null
 $exitCode     = 0
@@ -235,7 +257,7 @@ try {
         }
     }
     else {
-        $available = @(Get-AvailableWave -InFolder $InFolder -RunningFolder $RunningFolder -Phase $Phase)
+        $available = @(Get-AvailableWave -InFolder $InFolder -RunningFolder $RunningFolder -ArchiveRoot $ArchiveRoot -Phase $Phase)
 
         if ($TakeOver) {
             # Only do this when you know the other run is really gone.
@@ -594,13 +616,9 @@ try {
             Write-BulkVMotionLog -Message ('Recorded phase {0} for {1} VM(s) in {2}.' -f $runPhase, $updates.Count, $wave.Name)
         }
 
-        $allDone = ($failed.Count -eq 0 -and $skipped.Count -eq 0 -and ($succeeded.Count + $alreadyDone.Count) -gt 0)
-        if ($allDone) {
-            $waveDestination = Join-Path $ArchiveRoot ('Phase{0}' -f $runPhase)
-        }
-        else {
-            $waveDestination = $InFolder
-            Write-BulkVMotionLog -Level Warning -Message "'$($wave.Name)' goes back to IN ($($failed.Count) failed, $($skipped.Count) skipped). Correct the failing rows and run phase $runPhase again - the VMs that are done will be skipped."
+        $waveDestination = Get-WaveHomeFolder -Path $wavePath
+        if ($failed.Count -gt 0 -or $skipped.Count -gt 0) {
+            Write-BulkVMotionLog -Level Warning -Message "'$($wave.Name)' still has VMs outstanding ($($failed.Count) failed, $($skipped.Count) skipped). Correct the failing rows and run phase $runPhase again - the VMs that are done will be skipped."
         }
     }
 
@@ -616,14 +634,14 @@ finally {
     if ($wavePath -and -not $ValidateOnly) {
         try {
             if (-not $waveDestination) {
-                $waveDestination = $InFolder
-                Write-BulkVMotionLog -Level Warning -Message "The run did not finish - '$([System.IO.Path]::GetFileName($wavePath))' is being returned to IN."
+                $waveDestination = Get-WaveHomeFolder -Path $wavePath
+                Write-BulkVMotionLog -Level Warning -Message "The run did not finish - '$([System.IO.Path]::GetFileName($wavePath))' is being returned to $(Split-Path -Leaf $waveDestination)."
             }
             $landed = Complete-WaveRun -Path $wavePath -Destination $waveDestination
             if ($landed) {
                 Write-BulkVMotionLog -Level Success -Message "Wave file is now at $landed"
                 if ($waveDestination -ne $InFolder -and $runPhase -lt 3) {
-                    Write-BulkVMotionLog -Message "When the next wave is due, move it back into IN and run phase $($runPhase + 1)."
+                    Write-BulkVMotionLog -Message "When the next wave is due, run phase $($runPhase + 1) and pick it from the list - there is nothing to move."
                 }
             }
         }
