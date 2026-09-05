@@ -100,7 +100,8 @@ What gets written, and where:
 | Wave picked | engineer, machine, process id, start time, phase | `Running/<wave>.run.json` |
 | Throughout the run | every decision and every migration | `LOGS/bulk-vmotion_<engineer>_<timestamp>.log` |
 | A VM completes the phase | `PhaseCompleted`, `CompletedAt`, `CompletedBy`, `ResultVIServer`, `ResultCluster`, `ResultHost`, `ResultDatastore`, and the phase's `PhaseNPortGroups` | the wave CSV, on that VM's row |
-| Dry run only | `PhaseNPortGroups` | the wave CSV, nothing else touched |
+| Port groups resolved, before any VM moves | `PhaseNPortGroups` | the wave CSV, every row that resolved |
+| Dry run only | `PhaseNPortGroups`, and nothing else | the wave CSV |
 | Run ends | one row per VM: status, duration, port groups, failure message | `LOGS/<wave>_phase<N>_<engineer>_result_<timestamp>.csv` |
 | Wave released | the run marker is deleted | `Running/` |
 
@@ -130,8 +131,14 @@ sequenceDiagram
     Run->>VC: connect using your stored credential
     Run->>Wave: move it into Running, write the run marker
 
+    Run->>VC: resolve the port groups for every VM in the wave
+    Run->>Wave: write PhaseNPortGroups for all of them
+    alt any VM has no port group
+        Run->>Eng: name them and stop, nothing migrated
+    end
+
     loop each VM, in wave order
-        Run->>VC: resolve the VM, its host, datastore and port groups
+        Run->>VC: pick its destination host and check its storage
         Run->>VC: read what is already migrating, yours and other engineers
         alt fits the host, datastore and network budget
             Run->>VC: start the migration
@@ -148,8 +155,18 @@ sequenceDiagram
     Run->>Eng: summary of migrated, already done and failed
 ```
 
-`-ValidateOnly` stops after the resolve step: it never claims the wave, never starts a
-migration, and writes only the `PhaseNPortGroups` column back.
+The port groups are settled for the **whole wave** before anything moves, and written into
+the CSV as they are resolved. If a single VM has no port group the run names it and stops
+without migrating anything, so you find out in the first seconds rather than after five VMs
+have already moved. The ones that did resolve are already recorded, so you only fix the row
+it named.
+
+Picking the destination host stays inside the loop on purpose: it chooses the host with the
+most free memory, so doing it for the whole wave up front would aim every VM at the same
+host.
+
+`-ValidateOnly` does the same resolving without claiming the wave and without migrating -
+useful for a first look, but no longer something you have to do first.
 
 ## Phase 1: cluster and VDS
 
@@ -169,14 +186,17 @@ Fill in all three phases now if you know them; each phase reads only its own col
 Anything left blank falls back to the config. Do not add the port group columns - that is
 the script's job.
 
-**2. Dry run.** Always.
+**2. Dry run, if you want one.** The real run resolves the port groups itself and refuses
+to migrate anything unless every VM in the wave resolves, so this step is optional. It is
+still worth doing on your first wave, or on one with unfamiliar VLANs, because it lets you
+look before anything is claimed:
 
 ```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 1 -SourceVIServer vc.corp.local -ValidateOnly
 ```
 
-Nothing is migrated, the wave stays in `IN/`, and no phase is recorded. What it does do is
-work out the port group for every NIC and write it into the file.
+Nothing is migrated, the wave stays where it is, and no phase is recorded. What it does do
+is work out the port group for every NIC and write it into the file.
 
 **3. Check what it resolved.** Open the CSV. A `Phase1PortGroups` column has appeared,
 with one entry per adapter:
@@ -199,7 +219,8 @@ The log says the same thing, with the VLAN it matched on:
 [vm-app-01] Will change : compute + network
 ```
 
-**4. Run it.** Same command without `-ValidateOnly`:
+**4. Run it.** Same command without `-ValidateOnly` - and this is the only step you
+actually need, because it does step 2's resolving itself:
 
 ```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 1 -SourceVIServer vc.corp.local
@@ -292,7 +313,8 @@ by VLAN a second time.
 **1. Nothing to move.** The wave is in `Phase2/` and a phase 3 run lists it. Phase 3 reads
 `Phase3Cluster` and `Phase3VDS`.
 
-**2. Dry run.** This one needs both vCenters:
+**2. Dry run, if you want one.** As in phase 1 this is optional; the real run resolves and
+refuses to move anything unless the whole wave resolves. It needs both vCenters:
 
 ```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 3 -SourceVIServer vc.corp.local -TargetVIServer vc-new.corp.local -ValidateOnly
@@ -378,6 +400,22 @@ at:
 Fix: put the port group you want in that VM's `Phase1PortGroups` / `Phase3PortGroups` cell
 and run the phase again. If the same pair of port groups affects every wave, add a row to
 `config/portgroup-exceptions.csv` instead and it is handled everywhere.
+
+**The run stopped and migrated nothing.** Every VM's port groups are resolved before the
+wave moves, and one of them could not be:
+
+```
+[SUCCESS] Resolved and recorded the port groups for 2 VM(s) in Phase1PortGroups.
+[ERROR  ] 1 of 3 VM(s) have no port group, so nothing in this wave was migrated:
+[ERROR  ] [vm-dmz-01] No target port group carries VLAN 999 (source port group 'PG-OLD-DMZ-999').
+[WARNING] Name the port group for those VM(s) in the Phase1PortGroups column of
+          wave-app-01.csv and run phase 1 again. The rest of the wave is already resolved
+          and recorded.
+```
+
+This is deliberate: a wave is all or nothing, so you never get half of one migrated and
+half not. Fix is below, and note the second line - the VMs that did resolve already have
+their port groups written, so only the named row needs touching.
 
 **No port group carries the VLAN at all.**
 

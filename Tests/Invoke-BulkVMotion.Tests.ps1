@@ -209,22 +209,35 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         (Get-InFiles -Paths $script:Paths).Count | Should -Be 1
     }
 
-    It 'keeps the wave in IN when a VM cannot be mapped, and finishes it on the re-run' {
+    It 'migrates nothing when one VM has no port group, then does the lot on the re-run' {
         $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-dmz-01')
 
         $first = Invoke-Runner -Paths $script:Paths -Phase 1
         $first.ExitCode | Should -Be 1
+
+        # All or nothing: vm-app-01 resolves fine but is not moved, because vm-dmz-01
+        # cannot be. Finding that out after five VMs had already moved is the thing this
+        # prevents.
+        (Get-Calls -Paths $script:Paths).Count        | Should -Be 0
         (Get-InFiles -Paths $script:Paths).Count      | Should -Be 1
         (Get-RunningFiles -Paths $script:Paths).Count | Should -Be 0
+        $first.Output | Should -Match 'nothing in this wave was migrated'
 
         $inProgress = @(Import-Csv -LiteralPath $script:Paths.Csv)
-        ($inProgress | Where-Object { $_.VMName -eq 'vm-app-01' }).PhaseCompleted | Should -Be '1'
+        ($inProgress | Where-Object { $_.VMName -eq 'vm-app-01' }).PhaseCompleted | Should -Be '0'
         ($inProgress | Where-Object { $_.VMName -eq 'vm-dmz-01' }).PhaseCompleted | Should -Be '0'
 
-        # Pin the port group the way an engineer would, then run the wave again.
+        # The work the run did do is kept: the VM that resolved has its port group written
+        # down, so only the problem row needs touching.
+        ($inProgress | Where-Object { $_.VMName -eq 'vm-app-01' }).Phase1PortGroups |
+            Should -Be 'Network adapter 1=PG-NEW-Prod-100'
+        ($inProgress | Where-Object { $_.VMName -eq 'vm-dmz-01' }).Phase1PortGroups |
+            Should -BeNullOrEmpty
+
+        # Name the port group for the one row that needs it, then run the wave again.
         $fixed = $inProgress | ForEach-Object {
-            $value = if ($_.VMName -eq 'vm-dmz-01') { 'Network adapter 1=PG-NEW-Test-200' } else { '' }
-            $_ | Add-Member -NotePropertyName 'Phase1PortGroups' -NotePropertyValue $value -Force -PassThru
+            if ($_.VMName -eq 'vm-dmz-01') { $_.Phase1PortGroups = 'Network adapter 1=PG-NEW-Test-200' }
+            $_
         }
         $fixed | Export-Csv -LiteralPath $script:Paths.Csv -NoTypeInformation
 
@@ -232,9 +245,40 @@ Describe 'Phase 1 - cluster change and VDS remap' {
         $second.ExitCode | Should -Be 0
 
         $calls = (Get-Calls -Paths $script:Paths) -join "`n"
-        @([regex]::Matches($calls, 'MOVE vm-app-01')).Count | Should -Be 1
+        $calls | Should -Match 'MOVE vm-app-01 .*portgroups=PG-NEW-Prod-100'
         $calls | Should -Match 'MOVE vm-dmz-01 .*portgroups=PG-NEW-Test-200'
         (Get-PhaseFiles -Paths $script:Paths -Phase 1).Count | Should -Be 1
+    }
+
+    It 'records the port groups for every VM before the first one moves' {
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-multinic-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        $run.Output   | Should -Match 'Resolving the port groups for the whole wave before anything moves'
+
+        $archived = Get-ArchivedCsv -Paths $script:Paths -Phase 1
+        ($archived | Where-Object { $_.VMName -eq 'vm-app-01' }).Phase1PortGroups |
+            Should -Be 'Network adapter 1=PG-NEW-Prod-100'
+        ($archived | Where-Object { $_.VMName -eq 'vm-multinic-01' }).Phase1PortGroups |
+            Should -Be 'Network adapter 1=PG-NEW-Prod-100; Network adapter 2=PG-NEW-Bkp-300'
+    }
+
+    It 'aborts the wave without a dry run having been needed' {
+        # No -ValidateOnly anywhere: the real run does the resolving itself.
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01', 'vm-app-02', 'vm-dmz-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+        # The message names the VM to fix and the column to fix it in.
+        $run.Output | Should -Match 'vm-dmz-01'
+        $run.Output | Should -Match 'Phase1PortGroups column'
+
+        $rows = @(Import-Csv -LiteralPath $script:Paths.Csv)
+        @($rows | Where-Object { $_.Phase1PortGroups }).Count | Should -Be 2
     }
 
     It 'reports a VM an earlier run already moved without touching it' {
@@ -432,6 +476,20 @@ Describe 'Phase 2 - storage only' {
         (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-phase1-01'
     }
 
+    It 'runs phase 2 without a port group pre-flight' {
+        # Phase 2 has no port groups, so the pre-flight must not get in the way.
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase2Datastore'
+            'vm-phase1-01,1,DS-NEW-01'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 2
+
+        $run.ExitCode | Should -Be 0
+        $run.Output   | Should -Not -Match 'Resolving the port groups'
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-phase1-01'
+    }
+
     It 'fails the VM when no target datastore is given' {
         $script:Paths = New-TestRun -CsvContent @('VMName,PhaseCompleted', 'vm-phase1-01,1')
 
@@ -471,6 +529,30 @@ Describe 'Phase 3 - cross vCenter, same storage' {
         $archived.ResultCluster    | Should -Be 'CL-FINAL-01'
         $archived.ResultDatastore  | Should -Be 'DS-NEW-01'
         $archived.Phase3PortGroups | Should -Be 'Network adapter 1=PG-VC2-Prod-100'
+    }
+
+    It 'aborts a phase 3 wave when a VM cannot be mapped onto the new VDS' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted'
+            'vm-phase2-01,2'
+            'vm-dmz-01,2'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 3
+
+        $run.ExitCode | Should -Be 1
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+        $run.Output | Should -Match 'nothing in this wave was migrated'
+
+        # Nothing was migrated, so every row still has phase 2 as its highest, and the
+        # wave belongs in Phase2 rather than IN.
+        (Get-PhaseFiles -Paths $script:Paths -Phase 2).Count | Should -Be 1
+        (Get-RunningFiles -Paths $script:Paths).Count        | Should -Be 0
+
+        # The one that did resolve is recorded against the phase 3 column.
+        $rows = Get-ArchivedCsv -Paths $script:Paths -Phase 2
+        ($rows | Where-Object { $_.VMName -eq 'vm-phase2-01' }).Phase3PortGroups |
+            Should -Be 'Network adapter 1=PG-VC2-Prod-100'
     }
 
     It 'refuses to run without a target vCenter' {

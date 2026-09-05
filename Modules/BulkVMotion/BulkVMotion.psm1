@@ -1842,7 +1842,12 @@ function New-VMMigrationPlan {
         [string]$DefaultCluster,
         [string]$DefaultDatastore,
         [string]$DefaultVDSwitch,
-        [double]$DatastoreReserveGB = 0
+        [double]$DatastoreReserveGB = 0,
+        # Resolve the VM and its port groups only, leaving host and storage alone. Used to
+        # settle the networking for a whole wave before any of it moves. Host selection is
+        # deliberately not included: it picks the host with the most free memory, so doing
+        # it for every VM up front would aim the whole wave at the same host.
+        [switch]$NetworkOnly
     )
 
     $crossVCenter = ($Phase -eq 3)
@@ -1923,7 +1928,10 @@ function New-VMMigrationPlan {
 
     #region Destination host --------------------------------------------------
 
-    if ($Phase -eq 2) {
+    if ($NetworkOnly) {
+        # Nothing to choose: this pass only settles the port groups.
+    }
+    elseif ($Phase -eq 2) {
         # Storage only: the VM does not leave the host it is on.
         $plan.TargetHost     = $vm.VMHost
         $plan.TargetCluster  = $plan.SourceCluster
@@ -1952,7 +1960,10 @@ function New-VMMigrationPlan {
 
     #region Storage -----------------------------------------------------------
 
-    if ($Phase -eq 2) {
+    if ($NetworkOnly) {
+        # Storage is settled when the VM is actually dispatched.
+    }
+    elseif ($Phase -eq 2) {
         if (-not $plan.DatastoreName) {
             $plan.Errors += 'Phase 2 is the storage move, so a target datastore is required. Set Phase2Datastore in the CSV or use -DefaultTargetDatastore.'
         }
@@ -2041,6 +2052,12 @@ function New-VMMigrationPlan {
     #endregion Networking
 
     $plan.Ready = ($plan.Errors.Count -eq 0)
+
+    if ($NetworkOnly) {
+        # The compute and storage flags were never worked out, so the conclusions drawn
+        # from them below would be meaningless. Only Ready, Errors and Mappings are valid.
+        return $plan
+    }
 
     if ($plan.Ready) {
         # Nothing left to do means an earlier run already did this phase for this VM.

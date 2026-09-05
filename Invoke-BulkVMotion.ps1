@@ -372,10 +372,76 @@ try {
 
     #endregion Take the wave
 
+    #region Settle the port groups for the whole wave ---------------------------
+
+    # Phase 2 has no port groups, and -ValidateOnly already resolves everything without
+    # migrating, so neither needs this pass.
+    $preflightColumn = Get-PhasePortGroupColumn -Phase $runPhase
+    $abortedByPreflight = $false
+
+    if (-not $ValidateOnly -and $preflightColumn) {
+        Write-BulkVMotionLog -Message 'Resolving the port groups for the whole wave before anything moves...'
+
+        $resolved   = @()
+        $unresolved = @()
+
+        foreach ($row in $wave.Rows) {
+            if ([int]$row.PhaseCompleted -ge $runPhase) { continue }
+
+            try {
+                $networkPlan = New-VMMigrationPlan -Row $row -Phase $runPhase -SourceServer $sourceServer -TargetServer $targetServer `
+                    -SwitchCache $switchCache -PortGroupCache $sourcePgCache -ExceptionMap $exceptionMap `
+                    -DefaultCluster $DefaultTargetCluster -DefaultDatastore $DefaultTargetDatastore `
+                    -DefaultVDSwitch $defaultSwitch -NetworkOnly
+            }
+            catch {
+                $unresolved += [pscustomobject]@{ VMName = $row.VMName; Reason = $_.Exception.Message }
+                continue
+            }
+
+            if ($networkPlan.Ready -and $networkPlan.Mappings.Count -gt 0) {
+                $resolved += [pscustomobject]@{
+                    CsvLine          = $row.CsvLine
+                    $preflightColumn = (ConvertTo-PortGroupList -Mapping $networkPlan.Mappings)
+                }
+                foreach ($detail in $networkPlan.NetworkDetails) {
+                    Write-BulkVMotionLog -VMName $row.VMName -Message ('Network     : {0}' -f $detail)
+                }
+            }
+            elseif (-not $networkPlan.Ready) {
+                $unresolved += [pscustomobject]@{ VMName = $row.VMName; Reason = ($networkPlan.Errors -join ' / ') }
+            }
+        }
+
+        # Whatever resolved is written down even when the rest of the wave did not, so the
+        # engineer only has to deal with the rows that are actually a problem.
+        if ($resolved.Count -gt 0) {
+            Update-MigrationCsv -Path $wavePath -Update $resolved
+            Write-BulkVMotionLog -Level Success -Message ('Resolved and recorded the port groups for {0} VM(s) in {1}.' -f $resolved.Count, $preflightColumn)
+        }
+
+        if ($unresolved.Count -gt 0) {
+            $abortedByPreflight = $true
+            $exitCode = 1
+            Write-BulkVMotionLog -Level Error -Message ("{0} of {1} VM(s) have no port group, so nothing in this wave was migrated:" -f $unresolved.Count, $wave.VMCount)
+            foreach ($entry in $unresolved) {
+                Write-BulkVMotionLog -Level Error -VMName $entry.VMName -Message $entry.Reason
+            }
+            Write-BulkVMotionLog -Level Warning -Message ("Name the port group for those VM(s) in the {0} column of {1} and run phase {2} again. The rest of the wave is already resolved and recorded." -f $preflightColumn, $wave.Name, $runPhase)
+        }
+        else {
+            # Re-read so the migration uses exactly the port groups just written, rather
+            # than resolving a second time and possibly landing somewhere else.
+            $wave.Rows = @(Import-MigrationCsv -Path $wavePath)
+        }
+    }
+
+    #endregion Settle the port groups for the whole wave
+
     #region Migrate --------------------------------------------------------------
 
-    $rows    = $wave.Rows
-    $summary['VMs total'] = $rows.Count
+    $rows    = if ($abortedByPreflight) { @() } else { $wave.Rows }
+    $summary['VMs total'] = $wave.VMCount
 
     $ledger  = New-MigrationCostLedger -NetworkMaximum $VMotionNetworkLimit
     Write-BulkVMotionLog -Message ('Concurrency              : vSphere cost model, host max 8, datastore max 128, vMotion network max {0}' -f $VMotionNetworkLimit)
