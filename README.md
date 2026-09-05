@@ -66,7 +66,7 @@ that wave has got.
 ```mermaid
 graph TD
     A[Engineer authors the wave CSV] --> IN[IN folder: a VM still has phase 1 to do]
-    IN -->|ValidateOnly| DRY[Dry run: writes PhaseNPortGroups only]
+    IN -->|ValidateOnly| DRY[Dry run: resolves and records, migrates nothing]
     DRY --> IN
     IN -->|you pick it for phase 1| RUN[Running folder: claimed by one engineer]
     P1[Phase1 folder: every VM has done phase 1] -->|you pick it for phase 2| RUN
@@ -105,8 +105,9 @@ What gets written, and where:
 | Run ends | one row per VM: status, duration, port groups, failure message | `LOGS/<wave>_phase<N>_<engineer>_result_<timestamp>.csv` |
 | Wave released | the run marker is deleted | `Running/` |
 
-The dry run row is the one to remember: it is the only write that happens without the wave
-being claimed, and what it writes is what you review before committing to the migration.
+The port group row is the one to remember: those are written before any VM moves, so the
+file records what the run decided even if it then stops. The dry run does the same thing
+without claiming the wave, which is the only difference between them.
 
 ## What a run does
 
@@ -262,7 +263,7 @@ a phase 2 run lists it for you. The only column phase 2 reads is `Phase2Datastor
 left it blank, fill it in now (the file is in `Phase1/`), or set `DefaultTargetDatastore`
 in the config.
 
-**2. Dry run.**
+**2. Dry run, if you want one.** Optional here too:
 
 ```powershell
 .\Invoke-BulkVMotion.ps1 -Phase 2 -SourceVIServer vc.corp.local -ValidateOnly
@@ -436,25 +437,29 @@ CSV cell.
 Fix: present the datastore to the new cluster, or take this VM out of the phase 1 wave and
 move it another way. Phase 1 deliberately never moves disks.
 
-**The wave came back to IN with some VMs done.** This is normal, not a failure of the run:
+**Some VMs migrated and some did not.** The port groups all resolved, so the wave started,
+but a migration itself failed - vCenter refused it, or it timed out:
 
 ```
-[INFO   ] Result for wave-app-01.csv phase 1: 1 migrated, 0 already done, 2 failed, 0 skipped.
-[WARNING] 'wave-app-01.csv' goes back to IN (2 failed, 0 skipped). Correct the failing rows
-          and run phase 1 again - the VMs that are done will be skipped.
+[ERROR  ] [vm-db-02] Failed: The virtual machine is not compatible with the destination host.
+[INFO   ] Result for wave-app-01.csv phase 1: 11 migrated, 0 already done, 1 failed, 0 skipped.
+[WARNING] 'wave-app-01.csv' still has VMs outstanding (1 failed, 0 skipped). Correct the
+          failing rows and run phase 1 again - the VMs that are done will be skipped.
 ```
 
 A wave only moves on once every row has reached the phase, so it stays in the folder for
-the phase all of its VMs have completed - `IN/` here, because some VMs have not finished
-phase 1. The rows that succeeded already carry `PhaseCompleted,1`:
+the phase all of its VMs have completed - `IN/` here, because one VM has not finished
+phase 1. The rows that succeeded carry `PhaseCompleted,1`, and the one that failed still
+has its port groups recorded from the pre-flight:
 
 ```csv
-vm-app-01,...,1,2026-09-01 15:26:26,dsjodin,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,,"Network adapter 1=PG-NEW-Prod-100"
-vm-dmz-01,...,0,,,,,,,
+vm-app-01,...,"Network adapter 1=PG-NEW-Prod-100",1,2026-09-01 15:26:26,dsjodin,vc.corp.local,CL-NEW-01,esx-new-02.corp.local,
+vm-db-02,...,"Network adapter 1=PG-NEW-SQL-110",0,,,,,,
 ```
 
-Fix: correct the failing rows and run the same phase again. The finished VMs are reported
-`AlreadyDone` and skipped without being touched. Do not delete them from the file.
+Fix: deal with whatever vCenter objected to, then run the same phase again. The finished
+VMs are reported `AlreadyDone` and skipped without being touched. Do not delete them from
+the file.
 
 **A wave is stuck in Running after a lost RDP session.** It appears in the picker as
 `Interrupted - CORP\bob started phase 1 at 09:14, then the process is gone`, and is
@@ -520,10 +525,15 @@ access VLAN. If a VLAN exists on **more than one** port group of the target swit
 is failed rather than guessed at, unless one candidate has exactly the same name as the
 source port group.
 
-**This is what the dry run is for.** `-ValidateOnly` writes the port groups it resolved
-into `PhaseNPortGroups` without migrating anything. Open the file, check every NIC landed
-where you expect, correct anything ambiguous, and the real run uses what is in the cell.
-`config/portgroup-exceptions.csv` does the same thing globally, by source port group name.
+**An ambiguous VLAN stops the whole wave**, because the port groups are resolved for every
+VM before any of them moves. The run names the VMs it could not settle, writes the ones it
+could into `PhaseNPortGroups`, and migrates nothing. Put the port group you want in the
+cell for the named rows and run the phase again.
+
+You do not need a dry run to get there - the real run resolves and records exactly the
+same way. `-ValidateOnly` just does it without claiming the wave, which is worth doing on
+a first wave or one with unfamiliar VLANs. `config/portgroup-exceptions.csv` solves the
+same problem globally, by source port group name, when the ambiguity affects every wave.
 
 ## Concurrency
 
@@ -576,8 +586,12 @@ stopped (connection failure, bad wave, blocked by a limit).
 
 ## What is checked before a VM is touched
 
-A VM is only migrated once all of this resolves - otherwise it is reported `Failed`, the
-wave goes back to `IN`, and the run continues with the next VM:
+**Phases 1 and 3 check the port groups for the whole wave before anything moves.** Every
+network adapter has to resolve to exactly one port group on that VM's target switch; if a
+single VM fails that, the run names it and migrates nothing at all.
+
+The rest is checked per VM as it is dispatched. A VM that fails one of these is reported
+`Failed` and the run carries on with the next:
 
 * the VM exists and its name is unambiguous
 * no pending vCenter question on the VM
@@ -587,7 +601,6 @@ wave goes back to `IN`, and the run continues with the next VM:
 * **phase 2**: the datastore exists and has room for the VM plus the reserve
 * **phase 3**: the VM's datastore exists on the new vCenter under the same name, which is
   what "the same shared volume" means in practice
-* **phases 1 and 3**: every network adapter resolves to exactly one target port group
 
 Powered-off VMs are migrated as a cold relocate and logged as such. Work that is not
 needed is not done: a VM already in the target cluster keeps the host DRS gave it, and a VM
