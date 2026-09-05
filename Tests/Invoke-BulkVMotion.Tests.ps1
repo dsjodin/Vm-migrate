@@ -304,6 +304,95 @@ Describe 'Phase 1 - cluster change and VDS remap' {
     }
 }
 
+Describe 'Pinning a destination host' {
+
+    AfterEach {
+        if ($script:Paths -and (Test-Path -LiteralPath $script:Paths.Root)) {
+            Remove-Item -LiteralPath $script:Paths.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'sends the VM to the host named in the CSV, not the emptiest one' {
+        # esx-new-02 has the most free memory, so it is what the script would pick on its
+        # own. Naming esx-new-01 has to beat that.
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1Cluster,Phase1Host'
+            'vm-app-01,CL-NEW-01,esx-new-01.corp.local'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'MOVE vm-app-01 -> host=esx-new-01\.corp\.local'
+        $run.Output | Should -Match 'pinned in the CSV'
+        (Get-ArchivedCsv -Paths $script:Paths -Phase 1)[0].ResultHost | Should -Be 'esx-new-01.corp.local'
+    }
+
+    It 'refuses a pinned host that sits in a different cluster' {
+        # esx-old-01 exists, but it is in CL-OLD-01. Without the check the VM would go
+        # there and the cluster named in the row would be silently ignored.
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1Cluster,Phase1Host'
+            'vm-app-01,CL-NEW-01,esx-old-01.corp.local'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message |
+            Should -Match "is in cluster 'CL-OLD-01', not the target cluster 'CL-NEW-01'"
+    }
+
+    It 'refuses a pinned host that is in maintenance' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1Cluster,Phase1Host'
+            'vm-app-01,CL-NEW-01,esx-new-09.corp.local'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-Calls -Paths $script:Paths).Count | Should -Be 0
+        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message |
+            Should -Match 'is Maintenance, so the VM cannot be migrated to it'
+    }
+
+    It 'refuses a pinned host that does not exist' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,Phase1Cluster,Phase1Host'
+            'vm-app-01,CL-NEW-01,esx-typo-99.corp.local'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 1
+        (Get-ResultCsv -Paths $script:Paths | Select-Object -First 1).Message | Should -Match 'was not found'
+    }
+
+    It 'never picks a host that is in maintenance when choosing on its own' {
+        # esx-new-09 has the most free memory of all, but it is in maintenance.
+        $script:Paths = New-TestRun -CsvContent @('VMName', 'vm-app-01')
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 1
+
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Not -Match 'esx-new-09'
+    }
+
+    It 'pins a host on the new vCenter in phase 3' {
+        $script:Paths = New-TestRun -CsvContent @(
+            'VMName,PhaseCompleted,Phase3Cluster,Phase3Host'
+            'vm-phase2-01,2,CL-FINAL-01,esx-vc2-02.corp.local'
+        )
+
+        $run = Invoke-Runner -Paths $script:Paths -Phase 3
+
+        $run.ExitCode | Should -Be 0
+        (Get-Calls -Paths $script:Paths) -join '' | Should -Match 'host=esx-vc2-02\.corp\.local'
+    }
+}
+
 Describe 'Multiple NICs and per VM switches' {
 
     AfterEach {

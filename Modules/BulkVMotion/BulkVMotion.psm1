@@ -1287,9 +1287,14 @@ function Select-TargetVMHost {
     .SYNOPSIS
         Picks the destination host in the target cluster.
     .DESCRIPTION
-        An explicit host from the CSV always wins. Otherwise the connected, powered on
-        host that is not in maintenance/standby mode and has the most free memory is
-        chosen; DRS is free to rebalance the VM afterwards.
+        A host named in the CSV always wins - there are good reasons to pin one, such as
+        licensing tied to hardware, a vGPU, or keeping off a host that is about to be
+        patched. It is still checked: it has to exist, be connected and powered on, and be
+        in the target cluster, because a host name that turns out to sit in a different
+        cluster would quietly send the VM somewhere the CSV never asked for.
+
+        With no host named, the connected and powered on host with the most free memory is
+        chosen, and DRS is free to rebalance afterwards.
     #>
     [CmdletBinding()]
     param(
@@ -1299,16 +1304,34 @@ function Select-TargetVMHost {
     )
 
     if ($HostName) {
-        $vmHost = Get-VMHost -Name $HostName -Server $Server -ErrorAction SilentlyContinue
-        if (-not $vmHost) { throw "Target host '$HostName' was not found on $($Server.Name)." }
+        $vmHost = @(Get-VMHost -Name $HostName -Server $Server -ErrorAction SilentlyContinue)
+        if ($vmHost.Count -eq 0) { throw "Host '$HostName' was not found on $($Server.Name)." }
+        if ($vmHost.Count -gt 1) { throw "Host name '$HostName' is ambiguous ($($vmHost.Count) matches) on $($Server.Name)." }
+        $vmHost = $vmHost[0]
+
         if ($vmHost.ConnectionState -ne 'Connected') {
-            throw "Target host '$HostName' is in state '$($vmHost.ConnectionState)'."
+            throw "Host '$HostName' is $($vmHost.ConnectionState), so the VM cannot be migrated to it."
         }
+        if ($vmHost.PowerState -ne 'PoweredOn') {
+            throw "Host '$HostName' is $($vmHost.PowerState), so the VM cannot be migrated to it."
+        }
+
+        # A pinned host outside the cluster the row names is a mistake, not a shortcut.
+        if ($ClusterName) {
+            $hostCluster = Get-Cluster -VMHost $vmHost -Server $Server -ErrorAction SilentlyContinue
+            if (-not $hostCluster) {
+                throw "The cluster of host '$HostName' could not be read, so it cannot be checked against the target cluster '$ClusterName'."
+            }
+            if ($hostCluster.Name -ne $ClusterName) {
+                throw "Host '$HostName' is in cluster '$($hostCluster.Name)', not the target cluster '$ClusterName'. Correct whichever of the two is wrong."
+            }
+        }
+
         return $vmHost
     }
 
     if (-not $ClusterName) {
-        throw 'Neither TargetCluster nor TargetHost was supplied for this VM and no default target cluster is configured.'
+        throw 'No target cluster and no target host for this VM. Set the cluster in the CSV, or use -DefaultTargetCluster.'
     }
 
     $cluster = Get-Cluster -Name $ClusterName -Server $Server -ErrorAction SilentlyContinue
@@ -1869,6 +1892,7 @@ function New-VMMigrationPlan {
         PortGroups     = @()
         NetworkDetails = @()
         Mappings       = @()
+        HostPinned     = $false
         ChangesCompute = $false
         ChangesStorage = $false
         ChangesNetwork = $false
@@ -1948,6 +1972,7 @@ function New-VMMigrationPlan {
             }
             else {
                 $plan.TargetHost = Select-TargetVMHost -Server $TargetServer -ClusterName $plan.TargetCluster -HostName $hostOverride
+                $plan.HostPinned = [bool]$hostOverride
             }
             $plan.ChangesCompute = $crossVCenter -or ($plan.TargetHost.Name -ne $plan.SourceHost)
         }
@@ -2085,7 +2110,8 @@ function Write-MigrationPlanReport {
     $vmName = $Plan.VMName
     Write-BulkVMotionLog -VMName $vmName -Message ('Phase       : {0}' -f $Plan.Phase)
     Write-BulkVMotionLog -VMName $vmName -Message ('Source      : host {0}, cluster {1}' -f $Plan.SourceHost, $Plan.SourceCluster)
-    Write-BulkVMotionLog -VMName $vmName -Message ('Destination : host {0}, cluster {1}' -f $(if ($Plan.TargetHost) { $Plan.TargetHost.Name } else { '<unresolved>' }), $Plan.TargetCluster)
+    $hostNote = if ($Plan.HostPinned) { ' (pinned in the CSV)' } else { '' }
+    Write-BulkVMotionLog -VMName $vmName -Message ('Destination : host {0}{1}, cluster {2}' -f $(if ($Plan.TargetHost) { $Plan.TargetHost.Name } else { '<unresolved>' }), $hostNote, $Plan.TargetCluster)
     Write-BulkVMotionLog -VMName $vmName -Message ('Datastore   : {0}' -f $(if ($Plan.Datastore) { $Plan.Datastore.Name } else { '<unchanged>' }))
     if ($Plan.VDSwitchName) {
         Write-BulkVMotionLog -VMName $vmName -Message ('Switch      : {0}' -f $Plan.VDSwitchName)
@@ -2268,6 +2294,7 @@ function New-EmptyPlan {
         PortGroups          = @()
         NetworkDetails      = @()
         Mappings            = @()
+        HostPinned          = $false
         ChangesCompute      = $false
         ChangesStorage      = $false
         ChangesNetwork      = $false

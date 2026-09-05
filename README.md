@@ -162,9 +162,10 @@ without migrating anything, so you find out in the first seconds rather than aft
 have already moved. The ones that did resolve are already recorded, so you only fix the row
 it named.
 
-Picking the destination host stays inside the loop on purpose: it chooses the host with the
-most free memory, so doing it for the whole wave up front would aim every VM at the same
-host.
+Picking the destination host stays inside the loop on purpose: when the script chooses, it
+takes the host with the most free memory, so doing that for the whole wave up front would
+aim every VM at the same host. **You can override it per VM** with `Phase1Host` /
+`Phase3Host` - see below.
 
 `-ValidateOnly` does the same resolving without claiming the wave and without migrating -
 useful for a first look, but no longer something you have to do first.
@@ -488,9 +489,11 @@ run's `-DefaultTargetCluster` / `-DefaultTargetDatastore` / `-TargetVDSwitch`.
 | `SourceCluster` | all | Only needed to disambiguate a duplicated VM name |
 | `Phase1Cluster` | 1 | Destination cluster |
 | `Phase1VDS` | 1 | Distributed switch this VM lands on |
+| `Phase1Host` | 1 | Optional. Pin this VM to one host instead of letting the script choose |
 | `Phase2Datastore` | 2 | Datastore or datastore cluster to move onto |
 | `Phase3Cluster` | 3 | Cluster on the new vCenter |
 | `Phase3VDS` | 3 | Distributed switch on the new vCenter |
+| `Phase3Host` | 3 | Optional. Pin this VM to one host on the new vCenter |
 | `Notes` | - | Free text, never touched |
 
 The script fills these in - do not write them by hand:
@@ -502,8 +505,37 @@ The script fills these in - do not write them by hand:
 | `CompletedAt`, `CompletedBy` | When, and which engineer |
 | `ResultVIServer`, `ResultCluster`, `ResultHost`, `ResultDatastore` | Where the VM actually landed |
 
-`Phase1Host` / `Phase3Host` also work if you ever need to pin a VM to one host instead of
-letting the script choose.
+### Pinning a VM to a specific host
+
+Leave `Phase1Host` / `Phase3Host` empty and the script picks the host with the most free
+memory in the target cluster, letting DRS rebalance afterwards. Name a host and that is
+where the VM goes - for hardware bound licensing, a vGPU, keeping a VM off a host that is
+about to be patched, or landing something on a known host so you can watch it:
+
+```csv
+VMName,Phase1Cluster,Phase1VDS,Phase1Host
+vm-lic-01,CL-NEW-01,VDS-NEW-01,esx-new-04.corp.local
+vm-app-01,CL-NEW-01,VDS-NEW-01,
+```
+
+A pinned host is still checked before anything moves. It has to exist, be connected, be
+powered on, and **be in the cluster the row names**. That last one matters: host names are
+looked up across the whole vCenter, so a typo that happens to match a host in another
+cluster would otherwise send the VM there and quietly ignore `Phase1Cluster`:
+
+```
+[ERROR  ] [vm-app-01] Host 'esx-old-01.corp.local' is in cluster 'CL-OLD-01', not the
+          target cluster 'CL-NEW-01'. Correct whichever of the two is wrong.
+```
+
+The plan says which of the two happened, so a dry run shows it:
+
+```
+[vm-lic-01] Destination : host esx-new-04.corp.local (pinned in the CSV), cluster CL-NEW-01
+[vm-app-01] Destination : host esx-new-02.corp.local, cluster CL-NEW-01
+```
+
+Phase 2 has no host column: a Storage vMotion leaves the VM on the host it is already on.
 
 `docs/samples/wave1.csv` is a wave as you would author it;
 `docs/samples/wave1-after-phase1.csv` is the same file after a phase 1 run.
@@ -595,7 +627,8 @@ The rest is checked per VM as it is dispatched. A VM that fails one of these is 
 
 * the VM exists and its name is unambiguous
 * no pending vCenter question on the VM
-* the destination cluster has a connected host (or the named host is connected)
+* the destination cluster has a connected host, or - if the row pins one - that host
+  exists, is connected, is powered on and is in the cluster the row names
 * **phase 1**: every datastore the VM uses is mounted on the destination host - storage
   does not move in phase 1, so a host that cannot see the disks would fail the vMotion
 * **phase 2**: the datastore exists and has room for the VM plus the reserve

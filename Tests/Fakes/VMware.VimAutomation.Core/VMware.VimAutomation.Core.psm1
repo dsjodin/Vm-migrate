@@ -49,6 +49,7 @@ $script:HostDatastores = @{
     'esx-vc2-01.corp.local' = @('DS-NEW-01')
     'esx-vc2-02.corp.local' = @('DS-NEW-01')
     'esx-iso-01.corp.local' = @('DS-ISOLATED')
+    'esx-new-09.corp.local' = @('DS-OLD-01', 'DS-NEW-01')
 }
 
 $script:HostCluster = @{
@@ -58,6 +59,7 @@ $script:HostCluster = @{
     'esx-vc2-01.corp.local' = 'CL-FINAL-01'
     'esx-vc2-02.corp.local' = 'CL-FINAL-01'
     'esx-iso-01.corp.local' = 'CL-NOSAN'
+    'esx-new-09.corp.local' = 'CL-NEW-01'
 }
 
 $script:Hosts = @(
@@ -67,6 +69,9 @@ $script:Hosts = @(
     [pscustomobject]@{ Name = 'esx-vc2-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
     [pscustomobject]@{ Name = 'esx-vc2-02.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 200 }
     [pscustomobject]@{ Name = 'esx-iso-01.corp.local'; ConnectionState = 'Connected'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 100 }
+    # In CL-NEW-01 but in maintenance, so it must never be chosen and must be refused if
+    # somebody pins it.
+    [pscustomobject]@{ Name = 'esx-new-09.corp.local'; ConnectionState = 'Maintenance'; PowerState = 'PoweredOn'; MemoryTotalGB = 512; MemoryUsageGB = 0 }
 )
 
 $script:Datastores = @{

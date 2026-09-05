@@ -1,5 +1,6 @@
-VMName,SourceCluster,Phase1Cluster,Phase1VDS,Phase2Datastore,Phase3Cluster,Phase3VDS,Notes
-vm-app-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,
-vm-app-02,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,
-vm-db-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,DS-NEW-SQL-01,CL-FINAL-01,VDS-VC2-01,Its own datastore in phase 2
-vm-web-01,CL-OLD-02,CL-NEW-02,VDS-NEW-02,DSC-NEW-DMZ,CL-FINAL-02,VDS-VC2-02,Two NICs on different VLANs
+VMName,SourceCluster,Phase1Cluster,Phase1VDS,Phase1Host,Phase2Datastore,Phase3Cluster,Phase3VDS,Phase3Host,Notes
+vm-app-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,,
+vm-app-02,CL-OLD-01,CL-NEW-01,VDS-NEW-01,,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,,
+vm-db-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,,DS-NEW-SQL-01,CL-FINAL-01,VDS-VC2-01,,Its own datastore in phase 2
+vm-lic-01,CL-OLD-01,CL-NEW-01,VDS-NEW-01,esx-new-04.corp.local,DSC-NEW-PROD,CL-FINAL-01,VDS-VC2-01,,Licensing tied to that host
+vm-web-01,CL-OLD-02,CL-NEW-02,VDS-NEW-02,,DSC-NEW-DMZ,CL-FINAL-02,VDS-VC2-02,,Two NICs on different VLANs
